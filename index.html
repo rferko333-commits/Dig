@@ -53,6 +53,8 @@ const CONFIG = { speed: 0.5, tile: 40, moveSpeed: 3, digTime: 1.8, goalMult: 4, 
   o2Hp: 12, o2Rate: 1.0, o2RubbleTime: 4, o2Max: 4,
   waterRubbleTime: 3, waterMaxBase: 12,
   makeCost: { D: 8, L: 10, F: 10, K: 8 },
+  unitBuildTime: { dwarf: 2.5, digger: 4.0, laser: 4.5, flyer: 4.5, truck: 3.5 },
+  bldBuildTime: { T: 3.5, D: 5.0, L: 5.5, F: 5.5, K: 5.0, O: 6.0, P: 5.5 },
   moles: [{ p: 0.005, s: 2.0 }, { p: 0.01, s: 1.0 }, { p: 0.02, s: 0.8 }] };
 
 const TIER_COLORS = [null, '#24d6b5', '#a46bff', '#ffd23f'];
@@ -160,8 +162,9 @@ const canDigTile = (w, x, y) => {
 const hpMax = c => CONFIG.digTime * (c === 'G' ? CONFIG.goalMult : c === 'H' ? CONFIG.hardMult : c === 'X' ? CONFIG.bedrockMult : 'EN'.includes(c) ? CONFIG.nucleusMult : 1);
 const sameOwners = (a, b) => a === b || (a && b && a.size === b.size && [...a].every(i => b.has(i)));
 const truckCap = w => 2 + (w.lvl || 0) * 2;
-const maxWaterCap = () => state.buildings.filter(b => b.type === 'P').reduce((s, b) => s + CONFIG.waterMaxBase + (b.lvl || 0) * 6, 0);
-
+const bldSize = b => b.type === 'T' ? 1 : 2;
+const totalQueued = () => state.buildings.reduce((s, b) => s + (b.queue ? b.queue.length : 0), 0);
+const maxWaterCap = () => state.buildings.filter(b => b.type === 'P' && b.built).reduce((s, b) => s + CONFIG.waterMaxBase + (b.lvl || 0) * 6, 0);
 function revealAround(sx, sy) {
   const rows = state.grid.length, cols = state.grid[0].length;
   if (sx < 0 || sy < 0 || sx >= cols || sy >= rows) return;
@@ -233,7 +236,7 @@ function newGame(lvObj = null) {
   const seen = grid.map(r => r.map(() => false));
   state = { grid, seen, marks: new Map(), dumpMarks: new Map(), waterMarks: new Map(), hp: {}, erode: {},
     rubble: 0, rock: 0, water: 0, crystals: 0, won: false, lost: false,
-    air: CONFIG.airMax, selected: new Set(), selBuilding: null, tele: null, building: false, drag: null, fx: [], moles: [], drops: [], buildings: [],
+    air: CONFIG.airMax, selected: new Set(), selBuilding: null, tele: null, building: false, drag: null, fx: [], popups: [], moles: [], drops: [], buildings: [],
     ai: { workers: [], marks: new Map(), rubble: 0, tele: null, t: 0, active: !!L.ai }, nuc: null, lostMiners: 0, notice: '', noticeT: 0, lostWhy: '', nextId: 0, workers: [], lavaWarned: false,
     total: grid.flat().filter(c => c === 'c').length };
   L.spawns.forEach(([x, y]) => addWorker(x + 0.5, y + 0.5));
@@ -299,9 +302,10 @@ function grantCrystalBoost() {
       w.pilot.max += CONFIG.crystalHp;
       w.pilot.hp = Math.min(w.pilot.max, w.pilot.hp + CONFIG.crystalHp);
     }
+    state.popups.push({ x: w.x, y: w.y - 0.4, txt: '+' + CONFIG.crystalHp + 'HP +' + Math.round(CONFIG.crystalDps * 100) + '%', t: 0, col: '#4fd8ff' });
   }
-  state.notice = 'Crystal collected! Units +' + CONFIG.crystalHp + ' HP & +' + Math.round(CONFIG.crystalDps * 100) + '% power!';
-  state.noticeT = 3.5;
+  state.notice = 'Crystal! All units +' + CONFIG.crystalHp + ' HP & +' + Math.round(CONFIG.crystalDps * 100) + '% attack!';
+  state.noticeT = 4;
 }
 
 function finishTile(x, y, team, byType) {
@@ -320,7 +324,6 @@ function finishTile(x, y, team, byType) {
   if (!team || DIRS.some(([dx, dy]) => isSeen(x + dx, y + dy) && '.TBNWVE'.includes(cell(x + dx, y + dy) || ' '))) {
     revealAround(x, y);
   }
-  state.fx.push({ x, y, t: 0, big: false });
   if (!state.lavaWarned && isSeen(x, y) && DIRS.some(([dx, dy]) => cell(x + dx, y + dy) === 'V')) {
     state.lavaWarned = true;
     state.notice = 'Lava exposed! It will slowly erode floor—dump gray rock walls to block it!'; state.noticeT = 4.5;
@@ -329,7 +332,7 @@ function finishTile(x, y, team, byType) {
     const near = [...state.workers, ...state.ai.workers].filter(o => !o.dead && ((o.job && o.job.x === x && o.job.y === y) || (o.job2 && o.job2.x === x && o.job2.y === y)));
     if (near.length) {
       near[Math.floor(Math.random() * near.length)].dead = true;
-      state.fx[state.fx.length - 1].big = true;
+      state.fx.push({ x, y, t: 0, big: true });
       if (!team) { state.notice = 'Cave-in! A miner was lost.'; state.noticeT = 3; }
     }
   }
@@ -385,7 +388,7 @@ function stepTruck(w, dt) {
     const loadKind = wantWater ? 'water' : wantRock ? 'rock' : (state.rock > 0 && hasBay('K')) ? 'rock' : (state.water > 0 && hasBay('P')) ? 'water' : null;
     if (!loadKind) { w.path = []; w.loadT = 0; return; }
     const bayType = loadKind === 'water' ? 'P' : 'K';
-    const bays = state.buildings.filter(b => b.type === bayType);
+    const bays = state.buildings.filter(b => b.type === bayType && b.built);
     if (!bays.length) return;
     const nearBay = bays.find(b => rectDist(w.x, w.y, b) <= 1.25);
     if (nearBay) {
@@ -518,10 +521,54 @@ function stepWorker(w, dt) {
         return;
       }
     }
-    if (w.type === 'truck') { stepTruck(w, dt); return; }
+   if (w.type === 'truck') { stepTruck(w, dt); return; }
     if (veh) { drive(w, dt); if (w.dest) return; if (w.type === 'laser' && w.fighting) return; }
-    if (w.fighting && !veh) return;
+    w.buildingSite = false;
+    if (w.fighting && !veh) return; // Priority 1: defend from attack
     if (w.board != null) { boardStep(w, dt); return; }
+    // Priority 2: miners automatically build unbuilt structures before digging
+    if (w.type === 'dwarf' && !w.team) {
+      const sites = state.buildings.filter(b => !b.built);
+      if (sites.length) {
+        const adj = sites.find(b => rectDist(w.x, w.y, b) <= 0.85);
+        if (adj) {
+          w.job = null; w.job2 = null; w.path = [];
+          w.buildingSite = true;
+          w.face = Math.atan2(adj.y + bldSize(adj) / 2 - w.y, adj.x + bldSize(adj) / 2 - w.x);
+          adj.prog += dt;
+          if (adj.prog >= adj.buildTime) {
+            adj.built = true;
+            if (adj.type === 'T') state.tele = adj;
+            state.notice = BAY[adj.type].name[0].toUpperCase() + BAY[adj.type].name.slice(1) + ' built!';
+            state.noticeT = 2.5;
+            updateHud();
+          }
+          return;
+        }
+        const goals = new Set();
+        for (const b of sites) {
+          const s = bldSize(b);
+          if (s === 1) goals.add(key(b.x, b.y));
+          for (let j = -1; j <= s; j++) for (let i = -1; i <= s; i++) {
+            if (i >= 0 && i < s && j >= 0 && j < s) continue;
+            if (isFloor(b.x + i, b.y + j)) goals.add(key(b.x + i, b.y + j));
+          }
+        }
+        w.repath = (w.repath || 0) - dt;
+        if (!w.buildPath || w.repath <= 0) {
+          w.repath = 0.5;
+          w.buildPath = pathToGoal(Math.floor(w.x), Math.floor(w.y), goals);
+        }
+        if (w.buildPath && w.buildPath.length) {
+          w.job = null; w.job2 = null;
+          w.path = w.buildPath;
+          walk(w, dt);
+          return;
+        }
+      } else {
+        w.buildPath = null;
+      }
+    }
     if (w.job && (!marksOf(w).has(key(w.job.x, w.job.y)) || !canDigTile(w, w.job.x, w.job.y))) { w.job = null; w.job2 = null; w.path = []; }
     if (w.job2 && (!marksOf(w).has(key(w.job2.x, w.job2.y)) || !canDigTile(w, w.job2.x, w.job2.y))) w.job2 = null;
     if (!w.job) {
@@ -602,6 +649,7 @@ function update(dt) {
 
   const wMax = maxWaterCap();
   for (const b of state.buildings) {
+    if (!b.built) continue;
     const lvl = b.lvl || 0;
     if (b.type === 'O') {
       if (state.air < CONFIG.airMax) {
@@ -623,6 +671,26 @@ function update(dt) {
         state.rubble -= 1;
         state.water = Math.min(wMax, state.water + 1);
         updateHud();
+      }
+    } else if (b.queue && b.queue.length) {
+      const q0 = b.queue[0];
+      q0.t = Math.min(q0.dur, q0.t + dt);
+      if (q0.t >= q0.dur) {
+        if (b.type === 'T') {
+          addWorker(b.x + 0.5, b.y + 0.5, 0, 'dwarf', 0);
+          b.queue.shift(); updateHud();
+        } else {
+          let spawned = false;
+          for (let j = -1; j <= 2 && !spawned; j++) for (let i = -1; i <= 2 && !spawned; i++) {
+            if (i >= 0 && i <= 1 && j >= 0 && j <= 1) continue;
+            if (isFloor(b.x + i, b.y + j)) {
+              addWorker(b.x + i + 0.5, b.y + j + 0.5, 0, q0.uType, b.lvl || 0);
+              if (q0.uType === 'laser' || q0.uType === 'flyer') { state.notice = 'Select a miner, then tap the vehicle to climb in.'; state.noticeT = 3.5; }
+              else if (q0.uType === 'truck') { state.notice = 'Select a Dump Truck and tap/drag floor, water, or lava.'; state.noticeT = 3.5; }
+              b.queue.shift(); spawned = true; updateHud();
+            }
+          }
+        }
       }
     }
   }
@@ -653,6 +721,8 @@ function update(dt) {
 
   for (const f of state.fx) f.t += dt;
   state.fx = state.fx.filter(f => f.t < 0.6);
+  for (const p of state.popups) p.t += dt;
+  state.popups = state.popups.filter(p => p.t < 1.5);
   if (state.noticeT > 0) { state.noticeT -= dt; if (state.noticeT <= 0) updateHud(); }
   if (state.ai.active) { state.ai.t += dt; if (state.ai.t >= CONFIG.aiThink) { state.ai.t = 0; aiThink(); } }
 
@@ -698,10 +768,19 @@ function update(dt) {
   for (const m of state.moles) {
     let near = null, nd = Infinity;
     for (const w of all) { const d = Math.hypot(m.x - w.x, m.y - w.y); if (d < nd) { nd = d; near = w; } }
-    if (near && nd < CONFIG.melee) { near.hp -= CONFIG.minerDps * m.s * dt; continue; }
+    if (near && nd < CONFIG.melee) {
+      m.face = Math.atan2(near.y - m.y, near.x - m.x);
+      m.attacking = true; m.atkT = (m.atkT || 0) + dt;
+      near.hp -= CONFIG.minerDps * m.s * dt; continue;
+    }
     let hit = null;
-    for (const b of state.buildings) if (b.type === 'O' && rectDist(m.x, m.y, b) < 0.6) hit = b;
-    if (hit) { hit.hp -= CONFIG.minerDps * m.s * dt; continue; }
+    for (const b of state.buildings) if (b.type === 'O' && b.built && rectDist(m.x, m.y, b) < 0.6) hit = b;
+    if (hit) {
+      m.face = Math.atan2(hit.y + 1 - m.y, hit.x + 1 - m.x);
+      m.attacking = true; m.atkT = (m.atkT || 0) + dt;
+      hit.hp -= CONFIG.minerDps * m.s * dt; continue;
+    }
+    m.attacking = false; m.atkT = 0;
     m.repath -= dt;
     if (m.repath <= 0) { m.repath = 0.4; m.path = pathToGoal(Math.floor(m.x), Math.floor(m.y), goals) || []; }
     let gx = null, gy = null, fromPath = false;
@@ -765,7 +844,7 @@ function update(dt) {
     updateHud();
   }
   state.ai.workers = state.ai.workers.filter(o => !o.dead);
-  const canRecover = state.tele ? state.rubble >= CONFIG.minerCost : state.rubble >= CONFIG.teleCost + CONFIG.minerCost;
+  const canRecover = (state.tele && state.tele.built) ? state.rubble >= CONFIG.minerCost : false;
   if (!state.workers.length && !canRecover) { state.lost = true; state.lostWhy = 'miners'; updateHud(); }
 }
 
@@ -782,15 +861,6 @@ function updateHud() {
   $('flyers').textContent = '' + countType('flyer');
   $('trucks').textContent = '' + countType('truck');
   $('units').textContent = totalUnits() + '/' + CONFIG.maxUnits;
-  $('build').hidden = !!state.tele;
-  $('build').disabled = state.rubble < CONFIG.teleCost || !!state.tele;
-  $('call').hidden = !state.tele;
-  $('call').disabled = !state.tele || state.rubble < CONFIG.minerCost || totalUnits() >= CONFIG.maxUnits;
-  for (const t of ['D', 'L', 'F', 'K', 'O', 'P']) {
-    const has = t !== 'O' && t !== 'P' && state.buildings.some(b => b.type === t), el = $('bay' + t);
-    if (!el) continue;
-    el.disabled = state.rubble < (has ? CONFIG.makeCost[t] : CONFIG.bayCost[t]) || (t === 'O' && state.buildings.filter(b => b.type === 'O').length >= CONFIG.o2Max) || (has && totalUnits() >= CONFIG.maxUnits);
-  }
   $('next').hidden = !state.won;
   $('next').textContent = customLevel ? 'Back to Editor' : last ? 'Play again' : 'Next level';
   $('msg').textContent = state.lost ? (state.lostWhy === 'air' ? 'Out of air. Press Restart to try again.' : state.lostWhy === 'nucleus' ? 'Your nucleus was destroyed. Press Restart to try again.' : 'All your units are gone. Press Restart to try again.')
@@ -798,14 +868,14 @@ function updateHud() {
     : state.noticeT > 0 ? state.notice
     : state.building === 'tele' ? 'Tap an open floor tile to place the teleporter.'
     : state.building ? 'Tap the top-left tile of a free 2 by 2 floor area.'
-    : state.selBuilding ? (BAY[state.selBuilding.type].name.toUpperCase() + ' Lv' + (state.selBuilding.lvl || 0) + '/3 selected — tap ▲ to upgrade.')
+    : state.selBuilding ? (BAY[state.selBuilding.type].name.toUpperCase() + (state.selBuilding.built ? (state.selBuilding.type === 'T' ? '' : ' Lv' + (state.selBuilding.lvl || 0) + '/3') : ' (building...)'))
     : state.selected.size ? state.selected.size + ' of ' + state.workers.length + ' units selected.' : '';
 }
 
 function updateAir() {
   let activeO2Rate = 0;
   for (const b of state.buildings) {
-    if (b.type === 'O' && (b.fuel > 0 || state.rubble >= 1)) activeO2Rate += CONFIG.o2Rate * (1 + 0.45 * (b.lvl || 0));
+    if (b.type === 'O' && b.built && (b.fuel > 0 || state.rubble >= 1)) activeO2Rate += CONFIG.o2Rate * (1 + 0.45 * (b.lvl || 0));
   }
   const rate = (CONFIG.airPerMiner * dwarves().length - activeO2Rate) * CONFIG.speed;
   $('airtxt').textContent = (rate > 0 ? '−' : '+') + Math.abs(rate).toFixed(2);
@@ -885,7 +955,7 @@ function draw(now) {
       if (c === 'G') gem(px, py, 16, '#ff4fa3', '#ffd0e6');
       if (c === 'N') gem(px, py, 16, '#8a7cff', '#ffffff');
       if (c === 'E') gem(px, py, 16, '#ff3b3b', '#ffd0d0');
-      if (c === 'T') drawTeleporter(px, py, now);
+      if (c === 'T' && (editor.active || !state.buildings.some(b => b.type === 'T' && b.x === x && b.y === y))) drawTeleporter(px, py, now);
       if (!editor.active) {
         if (state.marks.has(k)) {
           ctx.strokeStyle = c === 'X' ? '#d46bff' : c === 'H' ? '#ff9f43' : '#ffd23f'; ctx.lineWidth = 3; ctx.setLineDash([6, 4]);
@@ -949,16 +1019,16 @@ function draw(now) {
   }
   for (const f of state.fx) {
     if (!vis(f.x, f.y)) continue;
-    ctx.fillStyle = 'rgba(205,190,165,' + 0.5 * (1 - f.t / 0.6) + ')';
-    ctx.beginPath(); ctx.arc((f.x + 0.5) * T, (f.y + 0.5) * T, 10 + f.t * (f.big ? 60 : 35), 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = f.big ? 'rgba(255,140,60,' + 0.65 * (1 - f.t / 0.6) + ')' : 'rgba(205,190,165,' + 0.5 * (1 - f.t / 0.6) + ')';
+    ctx.beginPath(); ctx.arc((f.x + 0.5) * T, (f.y + 0.5) * T, 10 + f.t * (f.big ? 65 : 30), 0, Math.PI * 2); ctx.fill();
   }
   const collecting = new Set(state.workers.filter(o => o.collect).map(o => o.collect));
   for (const dr of state.drops) if (vis(Math.floor(dr.x), Math.floor(dr.y))) drawDrop(dr, now, collecting.has(dr));
   for (const b of state.buildings) drawBuilding(b, now);
   if (state.selBuilding) {
-    const b = state.selBuilding;
+    const b = state.selBuilding, bs = T * bldSize(b);
     ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2.5; ctx.setLineDash([6, 4]);
-    ctx.strokeRect(b.x * T - 2, b.y * T - 2, T * 2 + 4, T * 2 + 4);
+    ctx.strokeRect(b.x * T - 2, b.y * T - 2, bs + 4, bs + 4);
     ctx.setLineDash([]); ctx.lineWidth = 1;
   }
   const targeted = new Set(state.workers.filter(o => o.target).map(o => o.target));
@@ -973,6 +1043,12 @@ function draw(now) {
     (w.type === 'dwarf' ? dwarf : machine)(w, now);
     if (w.hp < w.max) hpBar(w.x * T, w.y * T - 22, w.hp / w.max);
   }
+  ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'center';
+  for (const p of state.popups) {
+    ctx.fillStyle = 'rgba(79,216,255,' + Math.max(0, 1 - p.t / 1.5) + ')';
+    ctx.fillText(p.txt, p.x * T, (p.y - p.t * 0.7) * T);
+  }
+  ctx.textAlign = 'left';
 }
 
 function drawTargetRing(cx, cy, now) {
@@ -1005,7 +1081,7 @@ function drawDrop(dr, now, ordered) {
 }
 
 function dwarf(w, now) {
-  const cx = w.x * T, digging = w.job && !w.path.length;
+  const cx = w.x * T, digging = (w.job && !w.path.length) || w.buildingSite;
   const y = w.y * T + (w.path.length ? Math.sin(now / 90 + w.id) * 1.5 : 0);
   if (state.selected.has(w.id)) { ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.ellipse(cx, w.y * T + 10, 13, 6, 0, 0, 6.28); ctx.stroke(); ctx.lineWidth = 1; }
   ctx.fillStyle = '#3b2a1e'; ctx.fillRect(cx - 5, y + 6, 4, 5); ctx.fillRect(cx + 1, y + 6, 4, 5);
@@ -1021,18 +1097,35 @@ function dwarf(w, now) {
   ctx.fillRect(cx - 7.5, y - 10.5, 15, 2);
   ctx.fillStyle = '#fff3a0'; ctx.beginPath(); ctx.arc(cx, y - 15, 1.8, 0, 6.28); ctx.fill();
   ctx.save(); ctx.translate(cx + 8, y + 2);
-  ctx.rotate(digging || w.fighting ? -0.9 + Math.sin(now / 110 + w.id) * 0.9 : -0.5);
+  let swing = -0.5, hitSpark = false;
+  if (digging || w.fighting) {
+    const cyc = ((now / 620) + w.id * 0.37) % 1;
+    if (cyc < 0.55) {
+      const u = cyc / 0.55;
+      swing = 0.2 - (1 - Math.pow(1 - u, 2)) * 1.75;
+    } else if (cyc < 0.82) {
+      const u = (cyc - 0.55) / 0.27;
+      swing = -1.55 + (u * u * u) * 2.0;
+      if (u > 0.8) hitSpark = true;
+    } else {
+      const u = (cyc - 0.82) / 0.18;
+      swing = 0.45 - u * 0.25; hitSpark = u < 0.35;
+    }
+  }
+  ctx.rotate(swing);
   ctx.strokeStyle = w.pickTier === 2 ? '#c47f17' : w.pickTier === 1 ? '#4a7a96' : '#8a5a2b';
   ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -14); ctx.stroke();
   ctx.strokeStyle = w.pickTier === 2 ? '#ffd23f' : w.pickTier === 1 ? '#5ce1ff' : '#c9ced3';
   ctx.lineWidth = w.pickTier ? 3.5 : 3; ctx.beginPath(); ctx.moveTo(-5, -14); ctx.lineTo(5, -14); ctx.stroke();
+  if (hitSpark) { ctx.fillStyle = '#fff3a0'; ctx.beginPath(); ctx.arc(4, -14, 3, 0, 6.28); ctx.fill(); }
   ctx.restore(); ctx.lineWidth = 1;
   ctx.fillStyle = '#f0c8a0'; ctx.beginPath(); ctx.arc(cx + 8, y + 2, 2, 0, 6.28); ctx.fill();
 }
 
-const BAY = { D: { name: 'digger', type: 'digger', color: '#e09218' }, L: { name: 'laser', type: 'laser', color: '#d94444' },
-  F: { name: 'flyer', type: 'flyer', color: '#3fb8e0' }, K: { name: 'truck', type: 'truck', color: '#6aa84f' },
-  O: { name: 'oxygen producer', type: null, color: '#37c9a5' }, P: { name: 'water plant', type: null, color: '#2b8cbe' } };
+const BAY = { T: { name: 'teleporter', type: 'dwarf', color: '#4fd8ff' }, D: { name: 'digger', type: 'digger', color: '#e09218' },
+  L: { name: 'laser', type: 'laser', color: '#d94444' }, F: { name: 'flyer', type: 'flyer', color: '#3fb8e0' },
+  K: { name: 'truck', type: 'truck', color: '#6aa84f' }, O: { name: 'oxygen producer', type: null, color: '#37c9a5' },
+  P: { name: 'water plant', type: null, color: '#2b8cbe' } };
 
 function drawLiquid(c, px, py, now) {
   const lava = c === 'V', t = now / 600;
@@ -1046,7 +1139,30 @@ function drawLiquid(c, px, py, now) {
 }
 
 function drawBuilding(b, now) {
-  const px = b.x * T, py = b.y * T, w = T * 2, cx = px + T, cy = py + T, lvl = b.lvl || 0;
+  const s = bldSize(b), px = b.x * T, py = b.y * T, w = T * s, cx = px + w / 2, cy = py + w / 2, lvl = b.lvl || 0;
+  if (!b.built) {
+    ctx.fillStyle = 'rgba(30,36,42,0.75)'; ctx.fillRect(px + 3, py + 3, w - 6, w - 6);
+    ctx.strokeStyle = '#ffd23f'; ctx.lineWidth = 2; ctx.setLineDash([5, 4]);
+    ctx.strokeRect(px + 3, py + 3, w - 6, w - 6); ctx.setLineDash([]); ctx.lineWidth = 1;
+    ctx.fillStyle = '#d99b43';
+    ctx.fillRect(px + 5, py + 5, 5, 5); ctx.fillRect(px + w - 10, py + 5, 5, 5);
+    ctx.fillRect(px + 5, py + w - 10, 5, 5); ctx.fillRect(px + w - 10, py + w - 10, 5, 5);
+    const f = Math.min(1, b.prog / b.buildTime);
+    ctx.fillStyle = 'rgba(0,0,0,0.65)'; ctx.fillRect(px + 6, cy - 4, w - 12, 7);
+    ctx.fillStyle = '#ffd23f'; ctx.fillRect(px + 6, cy - 4, (w - 12) * f, 7);
+    return;
+  }
+  if (b.type === 'T') {
+    drawTeleporter(px, py, now);
+    if (b.queue && b.queue.length) {
+      const q0 = b.queue[0], f = Math.min(1, q0.t / q0.dur);
+      ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(px + 4, py + w - 9, w - 8, 5);
+      ctx.fillStyle = '#4fd8ff'; ctx.fillRect(px + 4, py + w - 9, (w - 8) * f, 5);
+      ctx.fillStyle = '#ffffff'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('+' + b.queue.length, cx, py + 9); ctx.textAlign = 'left';
+    }
+    return;
+  }
   ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(px + 4, py + 6, w - 4, w - 4);
   ctx.fillStyle = '#262b30'; ctx.fillRect(px + 2, py + 2, w - 4, w - 4);
   ctx.strokeStyle = lvl ? TIER_COLORS[lvl] : '#4a545e'; ctx.lineWidth = lvl ? 2.5 : 2;
@@ -1134,6 +1250,13 @@ function drawBuilding(b, now) {
   for (let i = 0; i < lvl; i++) {
     ctx.fillStyle = TIER_COLORS[lvl];
     ctx.beginPath(); ctx.arc(px + 9 + i * 7, py + 9, 2.5, 0, 6.28); ctx.fill();
+  }
+  if (b.queue && b.queue.length) {
+    const q0 = b.queue[0], f = Math.min(1, q0.t / q0.dur);
+    ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(px + 8, py + w - 11, w - 16, 6);
+    ctx.fillStyle = '#7dff9b'; ctx.fillRect(px + 8, py + w - 11, (w - 16) * f, 6);
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText('Q:' + b.queue.length, px + w - 8, py + 12); ctx.textAlign = 'left';
   }
 }
 
@@ -1257,8 +1380,10 @@ function placeBay(x, y) {
     state.notice = 'Needs a free 2 by 2 floor area with nobody standing on it, and enough rubble.'; state.noticeT = 3; return;
   }
   for (const j of [0, 1]) for (const i of [0, 1]) state.grid[y + j][x + i] = 'B';
-  state.buildings.push({ type: t, x, y, lvl: 0, hp: t === 'O' ? CONFIG.o2Hp : 0, max: t === 'O' ? CONFIG.o2Hp : 0, fuel: 0, active: true });
+  state.buildings.push({ type: t, x, y, lvl: 0, built: false, prog: 0, buildTime: CONFIG.bldBuildTime[t],
+    hp: t === 'O' ? CONFIG.o2Hp : 0, max: t === 'O' ? CONFIG.o2Hp : 0, fuel: 0, active: true, queue: [] });
   state.rubble -= CONFIG.bayCost[t];
+  state.notice = 'Construction site placed — a miner will build it!'; state.noticeT = 3;
 }
 
 function walk(w, dt) {
@@ -1313,7 +1438,8 @@ function boardStep(w, dt) {
 }
 
 function rectDist(px, py, b) {
-  return Math.hypot(Math.max(b.x - px, 0, px - (b.x + 2)), Math.max(b.y - py, 0, py - (b.y + 2)));
+  const s = bldSize(b);
+  return Math.hypot(Math.max(b.x - px, 0, px - (b.x + s)), Math.max(b.y - py, 0, py - (b.y + s)));
 }
 
 function hpBar(cx, y, f, col) {
@@ -1327,7 +1453,10 @@ function drawMole(m) {
   const snout = m.s >= 2 ? '#d96b78' : m.s >= 1 ? '#e38d98' : '#e8a0a8';
   const claws = m.s >= 2 ? '#ffd23f' : m.s >= 1 ? '#d8e4ec' : '#f0d9a0';
   const eyes = m.s >= 2 ? '#ff3030' : m.s >= 1 ? '#ffae33' : '#111111';
-  ctx.save(); ctx.translate(cx, cy); ctx.rotate(m.face);
+  const lunge = m.attacking ? Math.max(0, Math.sin((m.atkT || 0) * 11)) * 5 : 0;
+  const swL = m.attacking ? Math.sin((m.atkT || 0) * 14) * 5 : 0;
+  const swR = m.attacking ? Math.cos((m.atkT || 0) * 14) * 5 : 0;
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(m.face); ctx.translate(lunge, 0);
   ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.beginPath(); ctx.ellipse(0, 3, r, r * 0.8, 0, 0, 6.28); ctx.fill();
   ctx.fillStyle = body; ctx.beginPath(); ctx.ellipse(0, 0, r, r * 0.85, 0, 0, 6.28); ctx.fill();
   if (m.s >= 2) {
@@ -1336,7 +1465,11 @@ function drawMole(m) {
     ctx.fillStyle = '#7e4a58'; ctx.beginPath(); ctx.ellipse(-r * 0.2, 0, r * 0.35, r * 0.28, 0, 0, 6.28); ctx.fill();
   }
   ctx.fillStyle = snout; ctx.beginPath(); ctx.arc(r, 0, 3 + m.s, 0, 6.28); ctx.fill();
-  ctx.fillStyle = claws; ctx.fillRect(r * 0.3, -r - 2, 5, 4); ctx.fillRect(r * 0.3, r - 2, 5, 4);
+  ctx.fillStyle = claws; ctx.fillRect(r * 0.3 + swL, -r - 2, 6, 4); ctx.fillRect(r * 0.3 + swR, r - 2, 6, 4);
+  if (m.attacking && lunge > 3.2) {
+    ctx.strokeStyle = 'rgba(255,140,140,0.85)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(r + 4, 0, 7, -0.9, 0.9); ctx.stroke(); ctx.lineWidth = 1;
+  }
   ctx.fillStyle = eyes; ctx.fillRect(r * 0.55, -3.5, 2.2, 2.2); ctx.fillRect(r * 0.55, 1.5, 2.2, 2.2);
   ctx.restore();
   if (m.hp < m.max) hpBar(cx, cy - r - 7, m.hp / m.max, '#ff5a5a');
@@ -1507,17 +1640,19 @@ function saveEditorLevel(asNew) {
   }
   writeSavedLevels(list);
 }
+
 const scr = e => { const r = canvas.getBoundingClientRect(); return { sx: (e.clientX - r.left) * canvas.width / r.width, sy: (e.clientY - r.top) * canvas.height / r.height }; };
 const pt = e => { const { sx, sy } = scr(e), fx = (sx / cam.z + cam.x) / T, fy = (sy / cam.z + cam.y) / T; return { fx, fy, x: Math.floor(fx), y: Math.floor(fy) }; };
+
 // ---- In-window interface ----
 let DPR = 1, helpOpen = true, buildOpen = false, makeOpen = false, miniOpen = true, miniDrag = false;
 const ui = { hit: [], mini: null, topH: 34, botH: 42, leftW: 38, rightW: 60 };
 const dom = id => $(id);
-const hasBay = t => state.buildings.some(b => b.type === t);
+const hasBay = t => state.buildings.some(b => b.type === t && b.built);
 const upgrCost = b => CONFIG.bayCost[b.type] * Math.pow(2, (b.lvl || 0) + 1);
 
 function upgradeSpecificBay(b) {
-  if (!b || (b.lvl || 0) >= 3) return;
+  if (!b || !b.built || (b.lvl || 0) >= 3) return;
   const cost = upgrCost(b);
   if (state.rubble < cost) { state.notice = 'Need ' + cost + ' rubble to upgrade.'; state.noticeT = 2.5; updateHud(); return; }
   state.rubble -= cost;
@@ -1548,7 +1683,8 @@ function wrap(text, maxW) {
 function flow(list, W, bottom) {
   const h = 28, g = 5, rows = [[]]; let x = 8;
   for (const b of list) {
-    b.w = b.w || (Math.ceil(ctx.measureText(b.label).width) + 18); b.h = h;
+    const costW = b.cost != null ? 18 + Math.ceil(ctx.measureText('' + b.cost).width) : 0;
+    b.w = b.w || (Math.ceil(ctx.measureText(b.label).width) + 18 + costW); b.h = h;
     if (x + b.w > W - 8 && rows[rows.length - 1].length) { rows.push([]); x = 8; }
     b.x = x; x += b.w + g; rows[rows.length - 1].push(b);
   }
@@ -1558,8 +1694,7 @@ function flow(list, W, bottom) {
 function barButtons() {
   const b = [
     { label: 'Select all', fn: () => dom('selall').click() },
-    { label: 'Buildings', fn: () => { buildOpen = !buildOpen; if (buildOpen) makeOpen = false; }, active: buildOpen },
-    { label: 'Make', fn: () => { makeOpen = !makeOpen; if (makeOpen) buildOpen = false; }, active: makeOpen },
+    { label: 'Buildings', fn: () => { buildOpen = !buildOpen; }, active: buildOpen },
     { label: miniOpen ? 'Map: on' : 'Map: off', fn: () => { miniOpen = !miniOpen; }, active: miniOpen },
     { label: dom('pan').textContent, fn: () => dom('pan').click(), active: panMode },
     { label: '+', fn: () => dom('zin').click() }, { label: '−', fn: () => dom('zout').click() },
@@ -1572,7 +1707,7 @@ function barButtons() {
 }
 function startBuild(t) {
   if (t === 'tele') {
-    if (state.tele || state.rubble < CONFIG.teleCost) return;
+    if (state.buildings.some(b => b.type === 'T') || state.rubble < CONFIG.teleCost) return;
     state.building = state.building === 'tele' ? false : 'tele';
   } else {
     if (state.rubble < CONFIG.bayCost[t]) return;
@@ -1582,54 +1717,60 @@ function startBuild(t) {
   state.selBuilding = null;
   updateHud();
 }
-function makeUnit(t) {
-  if (totalUnits() >= CONFIG.maxUnits) { state.notice = 'Unit limit reached (' + CONFIG.maxUnits + '/' + CONFIG.maxUnits + ').'; state.noticeT = 3; updateHud(); return; }
-  if (state.rubble <CONFIG.makeCost[t]) return;
-  const bays = state.buildings.filter(o => o.type === t).sort((a, b) => (b.lvl || 0) - (a.lvl || 0));
-  for (const b of bays) {
-    for (let j = -1; j <= 2; j++) for (let i = -1; i <= 2; i++) {
-      if (i >= 0 && i <= 1 && j >= 0 && j <= 1) continue;
-      if (isFloor(b.x + i, b.y + j)) {
-        state.rubble -= CONFIG.makeCost[t];
-        addWorker(b.x + i + 0.5, b.y + j + 0.5, 0, BAY[t].type, b.lvl || 0);
-        if (t === 'L' || t === 'F') { state.notice = 'Select a miner, then tap the vehicle to climb in.'; state.noticeT = 4; }
-        else if (t === 'K') { state.notice = 'Select a Dump Truck and tap/drag floor, water, or lava.'; state.noticeT = 4; }
-        updateHud(); return;
-      }
-    }
-  }
-  state.notice = 'No free floor beside the bay.'; state.noticeT = 3; updateHud();
+function queueUnitFrom(b) {
+  if (!b || !b.built || !BAY[b.type] || !BAY[b.type].type) return;
+  const uType = BAY[b.type].type;
+  const cost = b.type === 'T' ? CONFIG.minerCost : CONFIG.makeCost[b.type];
+  if (totalUnits() + totalQueued() >= CONFIG.maxUnits) { state.notice = 'Unit limit reached (' + CONFIG.maxUnits + '/' + CONFIG.maxUnits + ').'; state.noticeT = 3; updateHud(); return; }
+  if (state.rubble < cost) { state.notice = 'Need ' + cost + ' rubble.'; state.noticeT = 2.5; updateHud(); return; }
+  state.rubble -= cost;
+  b.queue.push({ uType, dur: CONFIG.unitBuildTime[uType], t: 0, cost });
+  updateHud();
+}
+function deleteBuilding(b) {
+  if (!b) return;
+  const s = bldSize(b);
+  for (let j = 0; j < s; j++) for (let i = 0; i < s; i++) state.grid[b.y + j][b.x + i] = '.';
+  const baseCost = b.type === 'T' ? CONFIG.teleCost : CONFIG.bayCost[b.type];
+  let refund = Math.floor(baseCost * 0.5);
+  if (b.queue) for (const q of b.queue) refund += q.cost;
+  state.rubble += refund;
+  if (b.type === 'T') state.tele = null;
+  state.buildings = state.buildings.filter(o => o !== b);
+  if (state.selBuilding === b) state.selBuilding = null;
+  state.notice = 'Building demolished (+' + refund + ' rubble refunded).'; state.noticeT = 2.5;
+  updateHud();
 }
 function buildButtons() {
   const o2Full = state.buildings.filter(b => b.type === 'O').length >= CONFIG.o2Max;
+  const hasTele = state.buildings.some(b => b.type === 'T');
   return [
-    { label: state.tele ? 'Teleporter ✓' : 'Teleporter ' + CONFIG.teleCost, off: !!state.tele || state.rubble < CONFIG.teleCost, active: state.building === 'tele', fn: () => startBuild('tele') },
-    { label: 'Digger bay ' + CONFIG.bayCost.D, off: state.rubble < CONFIG.bayCost.D, active: state.building === 'D', fn: () => startBuild('D') },
-    { label: 'Laser bay ' + CONFIG.bayCost.L, off: state.rubble < CONFIG.bayCost.L, active: state.building === 'L', fn: () => startBuild('L') },
-    { label: 'Flyer bay ' + CONFIG.bayCost.F, off: state.rubble < CONFIG.bayCost.F, active: state.building === 'F', fn: () => startBuild('F') },
-    { label: 'Truck bay ' + CONFIG.bayCost.K, off: state.rubble < CONFIG.bayCost.K, active: state.building === 'K', fn: () => startBuild('K') },
-    { label: 'O₂ gen ' + CONFIG.bayCost.O, off: o2Full || state.rubble < CONFIG.bayCost.O, active: state.building === 'O', fn: () => startBuild('O') },
-    { label: 'Water plant ' + CONFIG.bayCost.P, off: state.rubble < CONFIG.bayCost.P, active: state.building === 'P', fn: () => startBuild('P') }
-  ];
-}
-function makeButtons() {
-  const full = totalUnits() >= CONFIG.maxUnits;
-  return [
-    { label: 'Call miner ' + CONFIG.minerCost, off: full || !state.tele || state.rubble < CONFIG.minerCost, fn: () => dom('call').click() },
-    { label: 'Make digger ' + CONFIG.makeCost.D, off: full || !hasBay('D') || state.rubble < CONFIG.makeCost.D, fn: () => makeUnit('D') },
-    { label: 'Make laser ' + CONFIG.makeCost.L, off: full || !hasBay('L') || state.rubble < CONFIG.makeCost.L, fn: () => makeUnit('L') },
-    { label: 'Make flyer ' + CONFIG.makeCost.F, off: full || !hasBay('F') || state.rubble < CONFIG.makeCost.F, fn: () => makeUnit('F') },
-    { label: 'Make truck ' + CONFIG.makeCost.K, off: full || !hasBay('K') || state.rubble < CONFIG.makeCost.K, fn: () => makeUnit('K') }
+    { label: hasTele ? 'Teleporter ✓' : 'Teleporter', cost: hasTele ? null : CONFIG.teleCost, off: hasTele || state.rubble < CONFIG.teleCost, active: state.building === 'tele', fn: () => startBuild('tele') },
+    { label: 'Digger bay', cost: CONFIG.bayCost.D, off: state.rubble < CONFIG.bayCost.D, active: state.building === 'D', fn: () => startBuild('D') },
+    { label: 'Laser bay', cost: CONFIG.bayCost.L, off: state.rubble < CONFIG.bayCost.L, active: state.building === 'L', fn: () => startBuild('L') },
+    { label: 'Flyer bay', cost: CONFIG.bayCost.F, off: state.rubble < CONFIG.bayCost.F, active: state.building === 'F', fn: () => startBuild('F') },
+    { label: 'Truck bay', cost: CONFIG.bayCost.K, off: state.rubble < CONFIG.bayCost.K, active: state.building === 'K', fn: () => startBuild('K') },
+    { label: 'O₂ gen', cost: CONFIG.bayCost.O, off: o2Full || state.rubble < CONFIG.bayCost.O, active: state.building === 'O', fn: () => startBuild('O') },
+    { label: 'Water plant', cost: CONFIG.bayCost.P, off: state.rubble < CONFIG.bayCost.P, active: state.building === 'P', fn: () => startBuild('P') }
   ];
 }
 function drawButtons(list) {
-  ctx.font = 'bold 12px system-ui, sans-serif'; ctx.textAlign = 'center';
+  ctx.font = 'bold 12px system-ui, sans-serif';
   for (const b of list) {
+    const costW = b.cost != null ? 16 + Math.ceil(ctx.measureText('' + b.cost).width) : 0;
     ctx.fillStyle = b.off ? 'rgba(40,40,46,0.85)' : b.active ? '#3fb8e0' : b.accent ? '#e0a030' : 'rgba(22,25,32,0.92)';
     rr(b.x, b.y, b.w, b.h, 8); ctx.fill(); ctx.strokeStyle = b.swatch ? b.swatch : 'rgba(255,255,255,0.25)'; ctx.stroke();
     if (b.swatch) { ctx.fillStyle = b.swatch; ctx.fillRect(b.x + 6, b.y + 7, 10, b.h - 14); }
     ctx.fillStyle = b.off ? '#7d848b' : b.active || b.accent ? '#06121a' : '#ffffff';
-    ctx.fillText(b.label, b.x + b.w / 2 + (b.swatch ? 5 : 0), b.y + b.h / 2 + 1);
+    ctx.textAlign = 'center';
+    const lblCx = b.x + (b.w - costW) / 2 + (b.swatch ? 5 : 0);
+    ctx.fillText(b.label, lblCx, b.y + b.h / 2 + 1);
+    if (b.cost != null) {
+      const rx = b.x + b.w - costW + 2;
+      iconRubble(rx, b.y + b.h / 2);
+      ctx.textAlign = 'left';
+      ctx.fillText('' + b.cost, rx + 8, b.y + b.h / 2 + 1);
+    }
     ui.hit.push({ x: b.x, y: b.y, w: b.w, h: b.h, fn: b.off ? () => {} : b.fn });
   }
   ctx.textAlign = 'left';
@@ -1732,7 +1873,9 @@ function drawUI() {
   iconRock(rx, 17); ctx.fillText('' + state.rock, rx + 11, 17); rx += ctx.measureText('' + state.rock).width + 26;
   iconWater(rx, 17); ctx.fillText('' + state.water, rx + 10, 17); rx += ctx.measureText('' + state.water).width + 26;
   iconCrystal(rx, 17);
-  const crysTxt = state.crystals + '/' + state.total + (state.crystals ? ' +' + (state.crystals * CONFIG.crystalHp) + 'HP' : '');
+  const hpB = state.crystals * CONFIG.crystalHp, pwrB = Math.round(state.crystals * CONFIG.crystalDps * 100);
+  const crysTxt = state.crystals + '/' + state.total + ' (+' + hpB + 'HP +' + pwrB + '% DMG)';
+  ctx.fillStyle = state.crystals ? '#7dff9b' : '#b8d0dc';
   ctx.fillText(crysTxt, rx + 10, 17);
   ctx.textAlign = 'right'; ctx.fillStyle = '#9fb0bb'; ctx.font = 'bold 12px ' + sans;
   const lvlTxt = customLevel ? customLevel.name : ('Lv ' + (levelIdx + 1) + '/' + LEVELS.length + (LEVELS[levelIdx].ai ? ' Boss' : ''));
@@ -1740,7 +1883,7 @@ function drawUI() {
 
   ctx.font = 'bold 12px ' + sans;
   const bar = barButtons(), barH = flow(bar, W, H - 4);
-  const sub = buildOpen ? buildButtons() : makeOpen ? makeButtons() : [];
+  const sub = buildOpen ? buildButtons() : [];
   const subH = sub.length ? flow(sub, W, H - 4 - barH) : 0;
   ui.botH = barH + subH + 4;
   ctx.fillStyle = 'rgba(12,14,18,0.6)'; ctx.fillRect(0, H - ui.botH, W, ui.botH);
@@ -1814,46 +1957,83 @@ function drawUI() {
     const b = state.selBuilding;
     if (!state.buildings.includes(b)) { state.selBuilding = null; }
     else {
-      const lvl = b.lvl || 0;
-      const sx = Math.max(lw + 75, Math.min(rx0 - 75, ((b.x + 1) * T - cam.x) * cam.z / DPR));
+      const s = bldSize(b), lvl = b.lvl || 0;
+      const sx = Math.max(lw + 95, Math.min(rx0 - 95, ((b.x + s / 2) * T - cam.x) * cam.z / DPR));
       const sy = Math.max(hudH + 22, Math.min(H - ui.botH - 22, (b.y * T - cam.y) * cam.z / DPR - 18));
-      const extraToggle = b.type === 'P' ? 42 : 0;
-      if (lvl < 3) {
-        const cost = upgrCost(b), can = state.rubble >= cost;
-        const lbl = '▲ Lv' + lvl + '→' + (lvl + 1) + '  ' + cost;
-        ctx.font = 'bold 12px ' + sans;
-        const upW = Math.ceil(ctx.measureText(lbl).width) + 30, pw = upW + extraToggle, ph = 28, px = sx - pw / 2, py = sy - ph / 2;
-        ctx.fillStyle = can ? 'rgba(20,30,38,0.95)' : 'rgba(30,24,24,0.9)';
-        rr(px, py, upW, ph, 8); ctx.fill();
-        ctx.strokeStyle = can ? '#4fd8ff' : '#7d848b'; ctx.lineWidth = 1.5; ctx.stroke(); ctx.lineWidth = 1;
-        ctx.fillStyle = can ? '#7dff9b' : '#7d848b';
-        ctx.fillText('▲ Lv' + lvl + '→' + (lvl + 1), px + 8, sy + 1);
-        const rOff = ctx.measureText('▲ Lv' + lvl + '→' + (lvl + 1) + ' ').width;
-        iconRubble(px + 14 + rOff, sy);
-        ctx.fillStyle = can ? '#ffffff' : '#9aa0a6';
-        ctx.fillText('' + cost, px + 24 + rOff, sy + 1);
-        ui.hit.push({ x: px, y: py, w: upW, h: ph, fn: () => upgradeSpecificBay(b) });
-        if (b.type === 'P') {
-          const tx = px + upW + 4, on = b.active !== false;
-          ctx.fillStyle = on ? '#1f4f6b' : '#4a2b2b'; rr(tx, py, 38, ph, 8); ctx.fill();
-          ctx.strokeStyle = on ? '#4fd8ff' : '#ff8a3d'; ctx.stroke();
-          ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.fillText(on ? 'ON' : 'OFF', tx + 19, sy + 1); ctx.textAlign = 'left';
-          ui.hit.push({ x: tx, y: py, w: 38, h: ph, fn: () => { b.active = b.active === false; } });
-        }
+      const items = [];
+      ctx.font = 'bold 12px ' + sans;
+      if (!b.built) {
+        const pct = Math.round((b.prog / b.buildTime) * 100);
+        items.push({ w: 112, draw: (bx, by, bw, bh) => {
+          ctx.fillStyle = 'rgba(20,24,30,0.94)'; rr(bx, by, bw, bh, 8); ctx.fill();
+          ctx.strokeStyle = '#ffd23f'; ctx.stroke();
+          ctx.fillStyle = '#ffd23f'; ctx.textAlign = 'center'; ctx.fillText('Building ' + pct + '%', bx + bw / 2, by + bh / 2 + 1); ctx.textAlign = 'left';
+        }, fn: () => {} });
       } else {
-        ctx.font = 'bold 12px ' + sans;
-        const upW = 76, px = sx - (upW + extraToggle) / 2, py = sy - 12;
-        ctx.fillStyle = 'rgba(22,25,32,0.92)'; rr(px, py, upW, 24, 8); ctx.fill();
-        ctx.strokeStyle = '#ffd23f'; ctx.stroke();
-        ctx.fillStyle = '#ffd23f'; ctx.textAlign = 'center'; ctx.fillText('MAX Lv3', px + upW / 2, sy + 1); ctx.textAlign = 'left';
-        ui.hit.push({ x: px, y: py, w: upW, h: 24, fn: () => {} });
-        if (b.type === 'P') {
-          const tx = px + upW + 4, on = b.active !== false;
-          ctx.fillStyle = on ? '#1f4f6b' : '#4a2b2b'; rr(tx, py, 38, 24, 8); ctx.fill();
-          ctx.strokeStyle = on ? '#4fd8ff' : '#ff8a3d'; ctx.stroke();
-          ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.fillText(on ? 'ON' : 'OFF', tx + 19, sy + 1); ctx.textAlign = 'left';
-          ui.hit.push({ x: tx, y: py, w: 38, h: 24, fn: () => { b.active = b.active === false; } });
+        if (BAY[b.type] && BAY[b.type].type) {
+          const uType = BAY[b.type].type, uCost = b.type === 'T' ? CONFIG.minerCost : CONFIG.makeCost[b.type];
+          const canQ = state.rubble >= uCost && totalUnits() + totalQueued() < CONFIG.maxUnits;
+          const cw = Math.ceil(ctx.measureText('+' + uCost).width) + 46;
+          items.push({ w: cw, draw: (bx, by, bw, bh) => {
+            ctx.fillStyle = canQ ? 'rgba(20,38,28,0.95)' : 'rgba(30,24,24,0.9)';
+            rr(bx, by, bw, bh, 8); ctx.fill();
+            ctx.strokeStyle = canQ ? '#7dff9b' : '#7d848b'; ctx.stroke();
+            iconUnit(uType, bx + 15, by + bh / 2);
+            ctx.fillStyle = canQ ? '#7dff9b' : '#7d848b'; ctx.fillText('+', bx + 27, by + bh / 2 + 1);
+            iconRubble(bx + 40, by + bh / 2);
+            ctx.fillStyle = canQ ? '#ffffff' : '#9aa0a6'; ctx.fillText('' + uCost, bx + 48, by + bh / 2 + 1);
+          }, fn: () => queueUnitFrom(b) });
+          if (b.queue && b.queue.length) {
+            items.push({ w: 34, draw: (bx, by, bw, bh) => {
+              ctx.fillStyle = 'rgba(45,30,20,0.94)'; rr(bx, by, bw, bh, 8); ctx.fill();
+              ctx.strokeStyle = '#ff9f43'; ctx.stroke();
+              ctx.fillStyle = '#ff9f43'; ctx.textAlign = 'center'; ctx.fillText('-Q', bx + bw / 2, by + bh / 2 + 1); ctx.textAlign = 'left';
+            }, fn: () => { const q = b.queue.pop(); if (q) { state.rubble += q.cost; updateHud(); } } });
+          }
         }
+        if (b.type !== 'T') {
+          if (lvl < 3) {
+            const cost = upgrCost(b), can = state.rubble >= cost;
+            const upLbl = '▲ Lv' + lvl + '→' + (lvl + 1);
+            const upW = Math.ceil(ctx.measureText(upLbl + ' ' + cost).width) + 32;
+            items.push({ w: upW, draw: (bx, by, bw, bh) => {
+              ctx.fillStyle = can ? 'rgba(20,30,38,0.95)' : 'rgba(30,24,24,0.9)';
+              rr(bx, by, bw, bh, 8); ctx.fill();
+              ctx.strokeStyle = can ? '#4fd8ff' : '#7d848b'; ctx.stroke();
+              ctx.fillStyle = can ? '#7dff9b' : '#7d848b'; ctx.fillText(upLbl, bx + 7, by + bh / 2 + 1);
+              const rOff = ctx.measureText(upLbl + ' ').width;
+              iconRubble(bx + 12 + rOff, by + bh / 2);
+              ctx.fillStyle = can ? '#ffffff' : '#9aa0a6'; ctx.fillText('' + cost, bx + 22 + rOff, by + bh / 2 + 1);
+            }, fn: () => upgradeSpecificBay(b) });
+          } else {
+            items.push({ w: 66, draw: (bx, by, bw, bh) => {
+              ctx.fillStyle = 'rgba(22,25,32,0.92)'; rr(bx, by, bw, bh, 8); ctx.fill();
+              ctx.strokeStyle = '#ffd23f'; ctx.stroke();
+              ctx.fillStyle = '#ffd23f'; ctx.textAlign = 'center'; ctx.fillText('MAX Lv3', bx + bw / 2, by + bh / 2 + 1); ctx.textAlign = 'left';
+            }, fn: () => {} });
+          }
+        }
+        if (b.type === 'P') {
+          const on = b.active !== false;
+          items.push({ w: 36, draw: (bx, by, bw, bh) => {
+            ctx.fillStyle = on ? '#1f4f6b' : '#4a2b2b'; rr(bx, by, bw, bh, 8); ctx.fill();
+            ctx.strokeStyle = on ? '#4fd8ff' : '#ff8a3d'; ctx.stroke();
+            ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.fillText(on ? 'ON' : 'OFF', bx + bw / 2, by + bh / 2 + 1); ctx.textAlign = 'left';
+          }, fn: () => { b.active = b.active === false; } });
+        }
+      }
+      items.push({ w: 36, draw: (bx, by, bw, bh) => {
+        ctx.fillStyle = 'rgba(65,22,22,0.95)'; rr(bx, by, bw, bh, 8); ctx.fill();
+        ctx.strokeStyle = '#ff5a5a'; ctx.stroke();
+        ctx.fillStyle = '#ff9a9a'; ctx.textAlign = 'center'; ctx.fillText('Del', bx + bw / 2, by + bh / 2 + 1); ctx.textAlign = 'left';
+      }, fn: () => deleteBuilding(b) });
+
+      const totW = items.reduce((a, it) => a + it.w, 0) + (items.length - 1) * 4;
+      let ix = Math.max(lw + 6, Math.min(rx0 - totW - 6, sx - totW / 2)), iy = sy - 14;
+      for (const it of items) {
+        it.draw(ix, iy, it.w, 28);
+        ui.hit.push({ x: ix, y: iy, w: it.w, h: 28, fn: it.fn });
+        ix += it.w + 4;
       }
     }
   }
@@ -2004,8 +2184,12 @@ canvas.addEventListener('pointerdown', e => {
   }
   if (state.won || state.lost) return;
   if (state.building) {
-    if (state.building !== 'tele') placeBay(x, y); else if (cell(x, y) === '.' && state.rubble >= CONFIG.teleCost) {
-      state.grid[y][x] = 'T'; state.tele = { x, y }; state.rubble -= CONFIG.teleCost;
+    if (state.building !== 'tele') placeBay(x, y); else if (cell(x, y) === '.' && state.rubble >= CONFIG.teleCost
+      && ![...state.workers, ...state.ai.workers, ...state.moles].some(o => !o.dead && Math.floor(o.x) === x && Math.floor(o.y) === y)) {
+      state.grid[y][x] = 'T';
+      const tb = { type: 'T', x, y, lvl: 0, built: false, prog: 0, buildTime: CONFIG.bldBuildTime.T, hp: 14, max: 14, queue: [] };
+      state.buildings.push(tb); state.rubble -= CONFIG.teleCost;
+      state.notice = 'Teleporter site placed — a miner will build it!'; state.noticeT = 3;
     }
     state.building = false; updateHud(); return;
   }
@@ -2016,7 +2200,7 @@ canvas.addEventListener('pointerdown', e => {
   for (const o of state.ai.workers) { if (!o.dead && isSeen(Math.floor(o.x), Math.floor(o.y))) { const dd = Math.hypot(o.x - fx, o.y - fy); if (dd < eBest) { eBest = dd; enemy = o; } } }
   let drop = null, dBest = 0.75;
   for (const dr of state.drops) { if (isSeen(Math.floor(dr.x), Math.floor(dr.y))) { const dd = Math.hypot(dr.x - fx, dr.y - fy); if (dd < dBest) { dBest = dd; drop = dr; } } }
-  const bld = state.buildings.find(b => fx >= b.x && fx < b.x + 2 && fy >= b.y && fy < b.y + 2);
+  const bld = state.buildings.find(b => { const s = bldSize(b); return fx >= b.x && fx < b.x + s && fy >= b.y && fy < b.y + s; });
 
   if (near) {
     state.selBuilding = null;
@@ -2138,20 +2322,6 @@ function endDrag(apply) {
 window.addEventListener('pointerup', () => endDrag(true));
 window.addEventListener('pointercancel', () => endDrag(false));
 $('selall').addEventListener('click', () => { state.selBuilding = null; state.workers.forEach(w => state.selected.add(w.id)); updateHud(); });
-$('build').addEventListener('click', () => startBuild('tele'));
-for (const t of ['D', 'L', 'F', 'K', 'O', 'P']) {
-  const el = $('bay' + t);
-  if (el) el.addEventListener('click', () => {
-    const b = t === 'O' || t === 'P' ? null : state.buildings.find(o => o.type === t);
-    if (!b) startBuild(t); else makeUnit(t);
-  });
-}
-$('call').addEventListener('click', () => {
-  if (totalUnits() >= CONFIG.maxUnits) { state.notice = 'Unit limit reached (' + CONFIG.maxUnits + '/' + CONFIG.maxUnits + ').'; state.noticeT = 3; updateHud(); return; }
-  if (state.tele && state.rubble >= CONFIG.minerCost) {
-    state.rubble -= CONFIG.minerCost; addWorker(state.tele.x + 0.5, state.tele.y + 0.5); updateHud();
-  }
-});
 $('restart').addEventListener('click', () => newGame());
 $('next').addEventListener('click', () => {
   if (customLevel) { openEditor(customLevel); return; }
