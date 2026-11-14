@@ -162,7 +162,6 @@ const sameOwners = (a, b) => a === b || (a && b && a.size === b.size && [...a].e
 const truckCap = w => 2 + (w.lvl || 0) * 2;
 const maxWaterCap = () => state.buildings.filter(b => b.type === 'P').reduce((s, b) => s + CONFIG.waterMaxBase + (b.lvl || 0) * 6, 0);
 
-// Flood-fill visibility across open cleared tiles and mark their 8 surrounding walls as seen
 function revealAround(sx, sy) {
   const rows = state.grid.length, cols = state.grid[0].length;
   if (sx < 0 || sy < 0 || sx >= cols || sy >= rows) return;
@@ -183,6 +182,33 @@ function revealAround(sx, sy) {
       }
     }
   }
+}
+
+// Center and zoom into the currently visible starting region
+function centerOnSeen() {
+  const rows = state.seen.length, cols = state.seen[0].length;
+  let minX = cols, minY = rows, maxX = -1, maxY = -1;
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    if (state.seen[y][x]) {
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+  }
+  if (maxX < minX) return;
+  const leftPx = (ui.leftW + 14) * DPR, rightPx = (ui.rightW + 14) * DPR;
+  const topPx = (ui.topH + 14) * DPR, botPx = (ui.botH + 14) * DPR;
+  const playW = Math.max(120, canvas.width - leftPx - rightPx);
+  const playH = Math.max(120, canvas.height - topPx - botPx);
+  const worldW = (maxX - minX + 2.5) * T, worldH = (maxY - minY + 2.5) * T;
+  const fitZ = Math.min(playW / worldW, playH / worldH);
+  cam.z = Math.max(1.2 * DPR, Math.min(2.2 * DPR, fitZ));
+  const cxWorld = ((minX + maxX + 1) / 2) * T;
+  const cyWorld = ((minY + maxY + 1) / 2) * T;
+  const centerScreenX = leftPx + playW / 2;
+  const centerScreenY = topPx + playH / 2;
+  cam.x = cxWorld - centerScreenX / cam.z;
+  cam.y = cyWorld - centerScreenY / cam.z;
+  clampCam();
 }
 
 function addWorker(x, y, team = 0, type = 'dwarf', lvl = 0) {
@@ -215,8 +241,8 @@ function newGame(lvObj = null) {
   grid.forEach((row, y) => row.forEach((c, x) => { if (c === 'N') state.nuc = [x, y]; }));
   (L.liquids || []).forEach(([ch, lx, ly, lw, lh]) => { for (let j = ly; j < ly + lh; j++) for (let i = lx; i < lx + lw; i++) if (grid[j] && grid[j][i] === '#') grid[j][i] = ch; });
   L.spawns.forEach(([x, y]) => revealAround(x, y));
-  resize(); cam.z = DPR;
-  cam.x = (L.spawns[0][0] + 0.5) * T - canvas.width / cam.z / 2; cam.y = (L.spawns[0][1] + 0.5) * T - canvas.height / cam.z / 2; clampCam();
+  resize();
+  centerOnSeen();
   updateHud();
 }
 
@@ -291,7 +317,6 @@ function finishTile(x, y, team, byType) {
   state.grid[y][x] = '.';
   state.marks.delete(k); state.ai.marks.delete(k);
   delete state.hp[k];
-  // Reveal newly connected cave if player dug or if tile touches already-seen open space
   if (!team || DIRS.some(([dx, dy]) => isSeen(x + dx, y + dy) && '.TBNWVE'.includes(cell(x + dx, y + dy) || ' '))) {
     revealAround(x, y);
   }
@@ -351,7 +376,6 @@ function collectItem(w, dr) {
   return true;
 }
 
-// Dump trucks handle both Rock Walls / Filling Water (K Truck Bay) and Water Moats (P Water Plant)
 function stepTruck(w, dt) {
   const cap = truckCap(w);
   if (w.cargo <= 0) {
@@ -427,10 +451,10 @@ function stepTruck(w, dt) {
         state.grid[y][x] = 'W';
         delete state.erode[k];
       } else if (cell(x, y) === 'W') {
-        state.grid[y][x] = '.'; // filling in water turns it into walkable ground
+        state.grid[y][x] = '.';
         revealAround(x, y);
       } else {
-        state.grid[y][x] = 'H'; // dumping rock builds gray rock wall
+        state.grid[y][x] = 'H';
         delete state.erode[k];
       }
       D.delete(k);
@@ -576,7 +600,6 @@ function update(dt) {
   dt *= CONFIG.speed;
   state.air -= CONFIG.airPerMiner * dwarves().length * dt;
 
-  // Oxygen generators & Water plants
   const wMax = maxWaterCap();
   for (const b of state.buildings) {
     const lvl = b.lvl || 0;
@@ -899,6 +922,11 @@ function draw(now) {
       ctx.strokeStyle = '#ff5a5a'; ctx.lineWidth = 2; ctx.strokeRect(ax * T + 3, ay * T + 3, T - 6, T - 6); ctx.lineWidth = 1;
       ctx.fillStyle = '#ffffff'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('A', (ax + 0.5) * T, (ay + 0.5) * T + 5); ctx.textAlign = 'left';
     }
+    if (editor.hover) {
+      const half = Math.floor(editor.brush / 2);
+      const bx = (editor.hover.x - half) * T, by = (editor.hover.y - half) * T, bs = editor.brush * T;
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.strokeRect(bx + 1, by + 1, bs - 2, bs - 2); ctx.lineWidth = 1;
+    }
     return;
   }
 
@@ -1070,7 +1098,6 @@ function drawBuilding(b, now) {
     ctx.fillStyle = '#232629'; ctx.fillRect(cx - 12, cy + 20, 6, 5); ctx.fillRect(cx + 6, cy + 20, 6, 5);
     ctx.fillStyle = '#a3b39c'; ctx.fillRect(cx - 10, cy + 7, 20, 4);
   } else if (b.type === 'P') {
-    // Water Plant: blue reservoir basin with animated ripples, intake pipes, and H2O badge
     const on = b.active !== false && state.rubble >= 1 && state.water < maxWaterCap();
     ctx.fillStyle = '#182b3a'; ctx.fillRect(px + 6, py + 6, w - 12, w - 12);
     ctx.fillStyle = '#235c82'; ctx.beginPath(); ctx.arc(cx, cy + 2, 23, 0, 6.28); ctx.fill();
@@ -1383,7 +1410,7 @@ const EDITOR_TILES = [
   { ch: 'A', name: 'Enemy', col: '#ff6e6e' }
 ];
 const EDITOR_SIZES = [[36, 24], [48, 32], [60, 40]];
-const editor = { active: false, grid: null, spawns: [], aiSpawns: [], tool: '#', brush: 1, sizeIdx: 0, name: 'Custom 1', savedOpen: false, painting: false };
+const editor = { active: false, grid: null, spawns: [], aiSpawns: [], tool: '.', brush: 1, sizeIdx: 0, name: 'Custom 1', savedOpen: false, painting: false, hover: null };
 
 function loadSavedLevels() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; }
@@ -1409,6 +1436,7 @@ function openEditor(fromLv) {
     initEditorFromBlank(...EDITOR_SIZES[editor.sizeIdx]);
   }
   editor.active = true; editor.savedOpen = false; buildOpen = false; makeOpen = false;
+  ui.leftW = 0; ui.rightW = 0; ui.mini = null;
   resize(); cam.z = DPR;
   cam.x = 0; cam.y = 0; clampCam();
 }
@@ -1555,7 +1583,7 @@ function startBuild(t) {
 }
 function makeUnit(t) {
   if (totalUnits() >= CONFIG.maxUnits) { state.notice = 'Unit limit reached (' + CONFIG.maxUnits + '/' + CONFIG.maxUnits + ').'; state.noticeT = 3; updateHud(); return; }
-  if (state.rubble < CONFIG.makeCost[t]) return;
+  if (state.rubble <CONFIG.makeCost[t]) return;
   const bays = state.buildings.filter(o => o.type === t).sort((a, b) => (b.lvl || 0) - (a.lvl || 0));
   for (const b of bays) {
     for (let j = -1; j <= 2; j++) for (let i = -1; i <= 2; i++) {
@@ -1612,7 +1640,7 @@ function miniGo(x, y) {
 
 function drawEditorUI(W, H, sans) {
   const hudH = 34;
-  ui.topH = hudH; ui.leftW = 0; ui.rightW = 0;
+  ui.topH = hudH; ui.leftW = 0; ui.rightW = 0; ui.mini = null;
   ctx.fillStyle = 'rgba(12,14,18,0.88)'; ctx.fillRect(0, 0, W, hudH);
   ui.hit.push({ x: 0, y: 0, w: W, h: hudH, fn: () => {} });
   ctx.font = 'bold 13px ' + sans; ctx.fillStyle = '#ffffff';
@@ -1693,7 +1721,6 @@ function drawUI() {
   const msg = dom('msg').textContent, over = state.won || state.lost;
   if (over) { ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(0, 0, W, H); }
 
-  // Top bar: sprite icons + counts ONLY
   const hudH = 34;
   ui.topH = hudH;
   ctx.fillStyle = 'rgba(12,14,18,0.85)'; ctx.fillRect(0, 0, W, hudH);
@@ -1710,7 +1737,6 @@ function drawUI() {
   const lvlTxt = customLevel ? customLevel.name : ('Lv ' + (levelIdx + 1) + '/' + LEVELS.length + (LEVELS[levelIdx].ai ? ' Boss' : ''));
   ctx.fillText(lvlTxt, W - 10, 17); ctx.textAlign = 'left';
 
-  // Bottom bar & single active submenu
   ctx.font = 'bold 12px ' + sans;
   const bar = barButtons(), barH = flow(bar, W, H - 4);
   const sub = buildOpen ? buildButtons() : makeOpen ? makeButtons() : [];
@@ -1721,7 +1747,6 @@ function drawUI() {
   if (sub.length) drawButtons(sub);
   drawButtons(bar);
 
-  // Left vertical Oxygen Bar outside gameplay area
   const lw = ui.leftW, sideH = Math.max(80, H - hudH - ui.botH);
   ctx.fillStyle = 'rgba(12,14,18,0.85)'; ctx.fillRect(0, hudH, lw, sideH);
   ui.hit.push({ x: 0, y: hudH, w: lw, h: sideH, fn: () => {} });
@@ -1739,7 +1764,6 @@ function drawUI() {
   ctx.fillText(dom('airtxt').textContent, lw / 2, oby + obh + 23);
   ctx.textAlign = 'left';
 
-  // Right vertical Unit Bar: sprite next to count
   const rw = ui.rightW, rx0 = W - rw;
   ctx.fillStyle = 'rgba(12,14,18,0.85)'; ctx.fillRect(rx0, hudH, rw, sideH);
   ui.hit.push({ x: rx0, y: hudH, w: rw, h: sideH, fn: () => {} });
@@ -1772,7 +1796,6 @@ function drawUI() {
     } });
   });
 
-  // Truck mode toggle (Rock Wall / Water Moat) when at least one truck is selected
   const truckSel = state.workers.some(w => w.type === 'truck' && state.selected.has(w.id));
   if (truckSel && !over) {
     ctx.font = 'bold 12px ' + sans;
@@ -1786,7 +1809,6 @@ function drawUI() {
     ui.hit.push({ x: bx, y: by, w: bw, h: bh, fn: () => { truckMode = truckMode === 'rock' ? 'water' : 'rock'; } });
   }
 
-  // In-game selected building upgrade widget (▲ + level + cost + Water Plant ON/OFF)
   if (state.selBuilding && !over) {
     const b = state.selBuilding;
     if (!state.buildings.includes(b)) { state.selBuilding = null; }
@@ -1835,7 +1857,6 @@ function drawUI() {
     }
   }
 
-  // Minimap (upper left next to O2 bar, respects fog of war)
   if (miniOpen) {
     const cols = state.grid[0].length, rows = state.grid.length, mw = Math.min(132, W * 0.28), cellSz = mw / cols, mh = cellSz * rows, mx = lw + 8, my = hudH + 8;
     ui.mini = { x: mx, y: my, w: mw, h: mh, cell: cellSz };
@@ -1906,7 +1927,7 @@ canvas.addEventListener('pointermove', e => {
   const r = canvas.getBoundingClientRect(); miniGo(e.clientX - r.left, e.clientY - r.top); e.stopImmediatePropagation();
 });
 const endMini = () => { miniDrag = false; };
-canvas.addEventListener('pointerup', endMini); canvas.addEventListener('pointercancel', endMini);
+window.addEventListener('pointerup', endMini); window.addEventListener('pointercancel', endMini);
 
 // ---- Camera ----
 const cam = { x: 0, y: 0, z: 1 };
@@ -1929,6 +1950,7 @@ function zoomAt(sx, sy, nz) {
   cam.z = nz; cam.x = wx - sx / nz; cam.y = wy - sy / nz; clampCam();
 }
 canvas.addEventListener('pointerdown', e => {
+  if (e.pointerType === 'mouse') ptrs.clear();
   ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (ptrs.size === 2) {
     state.drag = null; editor.painting = false;
@@ -1959,7 +1981,7 @@ const endPtr = e => {
   ptrs.delete(e.pointerId); if (ptrs.size < 2) gest = null;
   if (panning && panning.id === e.pointerId) { panning = null; e.stopImmediatePropagation(); }
 };
-canvas.addEventListener('pointerup', endPtr); canvas.addEventListener('pointercancel', endPtr);
+window.addEventListener('pointerup', endPtr); window.addEventListener('pointercancel', endPtr);
 canvas.addEventListener('contextmenu', e => e.preventDefault());
 canvas.addEventListener('wheel', e => { e.preventDefault(); const { sx, sy } = scr(e); zoomAt(sx, sy, cam.z * (e.deltaY < 0 ? 1.15 : 1 / 1.15)); }, { passive: false });
 addEventListener('keydown', e => {
@@ -1974,6 +1996,7 @@ canvas.addEventListener('pointerdown', e => {
   const { fx, fy, x, y } = pt(e);
   if (editor.active) {
     editor.painting = true;
+    editor.hover = { x, y };
     paintEditorAt(x, y);
     canvas.setPointerCapture(e.pointerId);
     return;
@@ -2061,9 +2084,10 @@ canvas.addEventListener('pointerdown', e => {
   updateHud();
 });
 canvas.addEventListener('pointermove', e => {
-  if (editor.active && editor.painting) {
+  if (editor.active) {
     const { x, y } = pt(e);
-    paintEditorAt(x, y);
+    editor.hover = { x, y };
+    if (editor.painting) paintEditorAt(x, y);
     return;
   }
   const d = state.drag; if (!d) return;
@@ -2110,8 +2134,8 @@ function endDrag(apply) {
   }
   updateHud();
 }
-canvas.addEventListener('pointerup', () => endDrag(true));
-canvas.addEventListener('pointercancel', () => endDrag(false));
+window.addEventListener('pointerup', () => endDrag(true));
+window.addEventListener('pointercancel', () => endDrag(false));
 $('selall').addEventListener('click', () => { state.selBuilding = null; state.workers.forEach(w => state.selected.add(w.id)); updateHud(); });
 $('build').addEventListener('click', () => startBuild('tele'));
 for (const t of ['D', 'L', 'F', 'K', 'O', 'P']) {
