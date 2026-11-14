@@ -1,0 +1,2148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Dig prototype</title>
+<style>
+:root{--bg:#e8ecef;--fg:#1b2228;--muted:#56626c;--btn:#1b2228;--btnfg:#e8ecef;--track:#c5ccd2;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#12171b;--fg:#e4e9ed;--muted:#9aa6b0;--btn:#e4e9ed;--btnfg:#12171b;--track:#2b343b}}
+:root[data-theme="dark"]{--bg:#12171b;--fg:#e4e9ed;--muted:#9aa6b0;--btn:#e4e9ed;--btnfg:#12171b;--track:#2b343b}
+html{height:100%;scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;height:100%;overflow:hidden;background:var(--bg)}
+#model{display:none}
+canvas{display:block;width:100%;height:100%;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="model">
+  <h1 id="title">Dig prototype</h1>
+  <div id="stats"><span id="rubble"></span><span id="rock"></span><span id="water"></span><span id="count"></span><span id="miners"></span><span id="diggers"></span><span id="lasers"></span><span id="flyers"></span><span id="trucks"></span><span id="units"></span><span id="airtxt"></span></div>
+  <div id="air"><div id="airfill"></div></div>
+  <p id="msg"></p>
+  <div id="btns">
+    <button id="selall">Select all</button>
+    <button id="build">Build teleporter</button>
+    <button id="call" hidden>Call miner</button>
+    <button id="bayD"></button><button id="bayL"></button><button id="bayF"></button><button id="bayK"></button><button id="bayO"></button><button id="bayP"></button>
+    <button id="next" hidden>Next level</button>
+    <button id="restart">Restart</button>
+    <button id="pan">Pan: off</button><button id="zin">Zoom +</button><button id="zout">Zoom −</button>
+  </div>
+  <p id="legend">Visibility is limited to open ground and adjacent walls (dug areas remain visible). Tap units to select them (or tap a unit icon on the right bar to select all of that type). Miners prioritize enemy miners over mole people; tap an enemy while units are selected to attack it, or tap ground drops to collect them. Tap a placed building in-game to show its ▲ upgrade arrow (3 upgrades each, 2× cost per tier). Diggers drill 2 tiles in front of them, break gray hard rock, and gather Rock. Dark Bedrock can only be cleared slowly by a crewed Laser. Exposed lava slowly erodes floor—use Dump Trucks to build rock walls, fill water into floor, or pour Water from a Water Plant to dig moats around your crystal! Open Editor to create, save, and play custom levels.</p>
+</div>
+<script>
+// ---- Settings ----
+const CONFIG = { speed: 0.5, tile: 40, moveSpeed: 3, digTime: 1.8, goalMult: 4, hardMult: 2.2, bedrockMult: 4.5,
+  rubblePerTile: 2, airMax: 240, airPerMiner: 0.3,
+  teleCost: 10, minerCost: 5, maxUnits: 30,
+  collapseChance: 0.02,
+  minerHp: 16, minerDps: 2.5, moleSpeed: 1.8, melee: 1.05,
+  lavaErodeTime: 15,
+  crystalHp: 2, crystalDps: 0.1,
+  nucleusMult: 12, aiThink: 2.5, aiMaxMiners: 4, aiSloppy: 8,
+  types: {
+    dwarf:  { hp: 16, dig: 0.85, speed: 3,   dps: 2.5, range: 1.05 },
+    digger: { hp: 20, dig: 3,    speed: 2.2, dps: 1,   range: 1.05 },
+    laser:  { hp: 15, dig: 0.9,  speed: 2.2, dps: 3,   range: 3.5 },
+    flyer:  { hp: 12, dig: 0.5,  speed: 4,   dps: 2.5, range: 1.6 },
+    truck:  { hp: 22, dig: 0,    speed: 2.5, dps: 0,   range: 0 }
+  },
+  bayCost: { D: 12, L: 15, F: 15, K: 14, O: 30, P: 20 },
+  o2Hp: 12, o2Rate: 1.0, o2RubbleTime: 4, o2Max: 4,
+  waterRubbleTime: 3, waterMaxBase: 12,
+  makeCost: { D: 8, L: 10, F: 10, K: 8 },
+  moles: [{ p: 0.005, s: 2.0 }, { p: 0.01, s: 1.0 }, { p: 0.02, s: 0.8 }] };
+
+const TIER_COLORS = [null, '#24d6b5', '#a46bff', '#ffd23f'];
+const STORAGE_KEY = 'dig_custom_levels_v1';
+
+// ---- Levels ----
+function genLevel(cols, rows, seed, boss) {
+  const r = rng(seed), g = Array.from({ length: rows }, () => Array(cols).fill('#'));
+  const carve = (cx, cy) => { for (let y = cy; y < cy + 5; y++) for (let x = cx; x < cx + 6; x++) g[y][x] = '.'; };
+  const px = 3, py = rows - 8;
+  carve(px, py); g[py + 2][px + 3] = 'N';
+  const lv = { spawns: [[px, py], [px + 5, py + 4]], liquids: [] };
+  const ax = cols - 10, ay = 3;
+  if (boss) { carve(ax, ay); g[ay + 2][ax + 3] = 'E'; lv.ai = { spawns: [[ax, ay], [ax + 5, ay + 4]] }; }
+  else g[3][cols - 4] = 'G';
+  const far = (x, y) => Math.hypot(x - px, y - py) > 9 && (boss ? Math.hypot(x - ax, y - ay) > 9 : Math.hypot(x - (cols - 4), y - 3) > 6);
+  for (let i = 0, n = Math.round(cols * rows / 110); i < n; i++) {
+    const x = 2 + Math.floor(r() * (cols - 4)), y = 2 + Math.floor(r() * (rows - 4));
+    if (g[y][x] === '#' && Math.hypot(x - px, y - py) > 5) g[y][x] = 'c';
+  }
+  for (let i = 0, n = Math.round(cols * rows / 55); i < n; i++) {
+    const cx = 2 + Math.floor(r() * (cols - 5)), cy = 2 + Math.floor(r() * (rows - 5));
+    if (Math.hypot(cx - px, cy - py) < 8) continue;
+    if (boss && Math.hypot(cx - ax, cy - ay) < 8) continue;
+    if (!boss && Math.hypot(cx - (cols - 4), cy - 3) < 5) continue;
+    const w = 1 + Math.floor(r() * 3), h = 1 + Math.floor(r() * 3);
+    for (let y = cy; y < cy + h && y < rows - 1; y++)
+      for (let x = cx; x < cx + w && x < cols - 1; x++)
+        if (g[y][x] === '#' && r() < 0.85) g[y][x] = 'H';
+  }
+  for (let i = 0, n = Math.round(cols * rows / 140); i < n; i++) {
+    const cx = 3 + Math.floor(r() * (cols - 6)), cy = 3 + Math.floor(r() * (rows - 6));
+    if (Math.hypot(cx - px, cy - py) < 10) continue;
+    if (boss && Math.hypot(cx - ax, cy - ay) < 10) continue;
+    if (!boss && Math.hypot(cx - (cols - 4), cy - 3) < 6) continue;
+    const w = 1 + Math.floor(r() * 2), h = 1 + Math.floor(r() * 2);
+    for (let y = cy; y < cy + h && y < rows - 1; y++)
+      for (let x = cx; x < cx + w && x < cols - 1; x++)
+        if ((g[y][x] === '#' || g[y][x] === 'H') && r() < 0.8) g[y][x] = 'X';
+  }
+  for (let i = 0, n = Math.round(cols * rows / 150); i < n; i++) {
+    const w = 3 + Math.floor(r() * 3), h = 2 + Math.floor(r() * 2), x = 2 + Math.floor(r() * (cols - w - 4)), y = 2 + Math.floor(r() * (rows - h - 4));
+    if (far(x, y) && far(x + w, y + h)) lv.liquids.push([r() < 0.5 ? 'W' : 'V', x, y, w, h]);
+  }
+  lv.grid = g.map(row => row.join(''));
+  return lv;
+}
+const LEVELS = [genLevel(40, 28, 11), genLevel(52, 36, 23), genLevel(60, 40, 37, true)];
+const COLORS = ['#ff8a3d', '#4aa3ff', '#7dff9b', '#ff6bd6', '#ffd23f', '#b49cff', '#ff5a5a', '#5af0e0'];
+const BEARDS = ['#c8651b', '#8a5a2b', '#d9d2c8', '#a33a2a', '#4a4036'];
+const T = CONFIG.tile;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const $ = id => document.getElementById(id);
+const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+let state, levelIdx = 0, customLevel = null, truckMode = 'rock';
+
+// ---- Textures ----
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function makeTex(base, pebble, seed, rock) {
+  const c = document.createElement('canvas'); c.width = c.height = T;
+  const g = c.getContext('2d'), r = rng(seed);
+  g.fillStyle = base; g.fillRect(0, 0, T, T);
+  for (let i = 0; i < 70; i++) {
+    g.fillStyle = r() < 0.5 ? 'rgba(0,0,0,' + (0.08 + r() * 0.15) + ')' : 'rgba(255,235,200,' + (0.05 + r() * 0.1) + ')';
+    g.fillRect(r() * T, r() * T, 1 + r() * 2.5, 1 + r() * 2.5);
+  }
+  if (rock) {
+    for (let i = 0; i < 4; i++) {
+      const px = 4 + r() * (T - 8), py = 4 + r() * (T - 8), rad = 2 + r() * 3;
+      g.fillStyle = 'rgba(0,0,0,0.25)'; g.beginPath(); g.ellipse(px + 1, py + 1, rad, rad * 0.8, 0, 0, 6.28); g.fill();
+      g.fillStyle = pebble; g.beginPath(); g.ellipse(px, py, rad, rad * 0.8, 0, 0, 6.28); g.fill();
+    }
+    g.strokeStyle = 'rgba(0,0,0,0.28)'; g.beginPath();
+    let cx = r() * T, cy = r() * T; g.moveTo(cx, cy);
+    for (let i = 0; i < 3; i++) { cx += (r() - 0.5) * 14; cy += (r() - 0.5) * 14; g.lineTo(cx, cy); }
+    g.stroke();
+    g.fillStyle = 'rgba(255,230,190,0.12)'; g.fillRect(0, 0, T, 2); g.fillRect(0, 0, 2, T);
+    g.fillStyle = 'rgba(0,0,0,0.3)'; g.fillRect(0, T - 2, T, 2); g.fillRect(T - 2, 0, 2, T);
+  } else {
+    g.strokeStyle = 'rgba(0,0,0,0.2)'; g.strokeRect(0.5, 0.5, T - 1, T - 1);
+  }
+  return c;
+}
+const ROCK = [0, 1, 2, 3].map(i => makeTex('#4a3626', '#6b5340', 100 + i, true));
+const HARD_ROCK = [0, 1, 2, 3].map(i => makeTex('#636a73', '#8f98a3', 300 + i, true));
+const BEDROCK = [0, 1, 2, 3].map(i => makeTex('#2b2e34', '#454a54', 400 + i, true));
+const FLOOR = [0, 1].map(i => makeTex('#211d1a', '#3a332d', 200 + i, false));
+
+// ---- Rules & Visibility ----
+const key = (x, y) => x + ',' + y;
+const cell = (x, y) => (state.grid[y] ? state.grid[y][x] : undefined);
+const isFloor = (x, y) => '.T'.includes(cell(x, y) || ' ');
+const isFly = (x, y) => '.TWV'.includes(cell(x, y) || ' ');
+const isRock = (x, y) => '#HXcGE'.includes(cell(x, y) || ' ');
+const isDumpTarget = (x, y) => '.WV'.includes(cell(x, y) || ' ');
+const isSeen = (x, y) => !!(state.seen[y] && state.seen[y][x]);
+const canDigTile = (w, x, y) => {
+  const c = cell(x, y);
+  if (c === 'X') return w.type === 'laser';
+  if (c === 'H') return w.type === 'digger';
+  if (w.type === 'laser') return false;
+  return '#cGE'.includes(c || ' ');
+};
+const hpMax = c => CONFIG.digTime * (c === 'G' ? CONFIG.goalMult : c === 'H' ? CONFIG.hardMult : c === 'X' ? CONFIG.bedrockMult : 'EN'.includes(c) ? CONFIG.nucleusMult : 1);
+const sameOwners = (a, b) => a === b || (a && b && a.size === b.size && [...a].every(i => b.has(i)));
+const truckCap = w => 2 + (w.lvl || 0) * 2;
+const maxWaterCap = () => state.buildings.filter(b => b.type === 'P').reduce((s, b) => s + CONFIG.waterMaxBase + (b.lvl || 0) * 6, 0);
+
+// Flood-fill visibility across open cleared tiles and mark their 8 surrounding walls as seen
+function revealAround(sx, sy) {
+  const rows = state.grid.length, cols = state.grid[0].length;
+  if (sx < 0 || sy < 0 || sx >= cols || sy >= rows) return;
+  const q = [[sx, sy]], vis = new Set([key(sx, sy)]);
+  for (let i = 0; i < q.length; i++) {
+    const [x, y] = q[i];
+    state.seen[y][x] = true;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if (nx >= 0 && ny >= 0 && nx < cols && ny < rows) state.seen[ny][nx] = true;
+    }
+    if ('.TBNWVE'.includes(cell(x, y) || ' ')) {
+      for (const [dx, dy] of DIRS) {
+        const nx = x + dx, ny = y + dy, k = key(nx, ny);
+        if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && !vis.has(k) && '.TBNWVE'.includes(cell(nx, ny) || ' ')) {
+          vis.add(k); q.push([nx, ny]);
+        }
+      }
+    }
+  }
+}
+
+function addWorker(x, y, team = 0, type = 'dwarf', lvl = 0) {
+  const id = state.nextId++, list = team ? state.ai.workers : state.workers;
+  const bonusHp = team ? 0 : state.crystals * CONFIG.crystalHp;
+  const hp = Math.round(CONFIG.types[type].hp * (1 + 0.4 * lvl)) + bonusHp;
+  list.push({ id, x, y, path: [], job: null, job2: null, target: null, collect: null, team, type, lvl,
+    color: team ? '#e04a4a' : COLORS[id % COLORS.length],
+    beard: BEARDS[id % BEARDS.length], hp, max: hp, fighting: false, pickTier: 0, face: 0, dumpT: 0, cargo: 0, cargoType: 'rock', loadT: 0 });
+}
+const dwarves = () => state.workers.filter(o => o.type === 'dwarf' || o.pilot);
+const countType = t => state.workers.filter(o => o.type === t).length;
+const totalUnits = () => dwarves().length + state.workers.filter(o => o.type !== 'dwarf').length;
+const marksOf = w => (w.team ? state.ai.marks : state.marks);
+const unitSpeed = w => CONFIG.types[w.type].speed * (1 + 0.12 * (w.lvl || 0));
+const unitRange = w => CONFIG.types[w.type].range + (w.type === 'laser' ? 0.5 * (w.lvl || 0) : 0);
+
+function newGame(lvObj = null) {
+  if (lvObj) customLevel = lvObj;
+  const L = customLevel || LEVELS[levelIdx];
+  const grid = L.grid.map(r => r.split(''));
+  const seen = grid.map(r => r.map(() => false));
+  state = { grid, seen, marks: new Map(), dumpMarks: new Map(), waterMarks: new Map(), hp: {}, erode: {},
+    rubble: 0, rock: 0, water: 0, crystals: 0, won: false, lost: false,
+    air: CONFIG.airMax, selected: new Set(), selBuilding: null, tele: null, building: false, drag: null, fx: [], moles: [], drops: [], buildings: [],
+    ai: { workers: [], marks: new Map(), rubble: 0, tele: null, t: 0, active: !!L.ai }, nuc: null, lostMiners: 0, notice: '', noticeT: 0, lostWhy: '', nextId: 0, workers: [], lavaWarned: false,
+    total: grid.flat().filter(c => c === 'c').length };
+  L.spawns.forEach(([x, y]) => addWorker(x + 0.5, y + 0.5));
+  if (L.ai) L.ai.spawns.forEach(([x, y]) => addWorker(x + 0.5, y + 0.5, 1));
+  grid.forEach((row, y) => row.forEach((c, x) => { if (c === 'N') state.nuc = [x, y]; }));
+  (L.liquids || []).forEach(([ch, lx, ly, lw, lh]) => { for (let j = ly; j < ly + lh; j++) for (let i = lx; i < lx + lw; i++) if (grid[j] && grid[j][i] === '#') grid[j][i] = ch; });
+  L.spawns.forEach(([x, y]) => revealAround(x, y));
+  resize(); cam.z = DPR;
+  cam.x = (L.spawns[0][0] + 0.5) * T - canvas.width / cam.z / 2; cam.y = (L.spawns[0][1] + 0.5) * T - canvas.height / cam.z / 2; clampCam();
+  updateHud();
+}
+
+function findJob(w, pred, allowTile = canDigTile) {
+  const pass = w.type === 'flyer' ? isFly : isFloor;
+  const sx = Math.floor(w.x), sy = Math.floor(w.y);
+  const prev = new Map([[key(sx, sy), null]]);
+  const queue = [[sx, sy]];
+  for (let i = 0; i < queue.length; i++) {
+    const [x, y] = queue[i];
+    for (const [dx, dy] of DIRS) {
+      const nx = x + dx, ny = y + dy, k = key(nx, ny);
+      if (allowTile(w, nx, ny) && pred(k)) {
+        const path = [];
+        let cur = [x, y];
+        while (cur) { path.push(cur); cur = prev.get(key(cur[0], cur[1])); }
+        path.reverse(); path.shift();
+        return { job: { x: nx, y: ny }, path };
+      }
+      if (pass(nx, ny) && !prev.has(k)) { prev.set(k, [x, y]); queue.push([nx, ny]); }
+    }
+  }
+  return null;
+}
+
+function pathToGoal(sx, sy, goals) {
+  const start = key(sx, sy);
+  if (goals.has(start)) return [];
+  const prev = new Map([[start, null]]), q = [[sx, sy]];
+  for (let i = 0; i < q.length; i++) {
+    const [x, y] = q[i];
+    for (const [dx, dy] of DIRS) {
+      const nx = x + dx, ny = y + dy, k = key(nx, ny);
+      if (prev.has(k) || !isFloor(nx, ny)) continue;
+      prev.set(k, [x, y]);
+      if (goals.has(k)) {
+        const path = []; let cur = [nx, ny];
+        while (cur && key(cur[0], cur[1]) !== start) { path.push(cur); cur = prev.get(key(cur[0], cur[1])); }
+        return path.reverse();
+      }
+      q.push([nx, ny]);
+    }
+  }
+  return null;
+}
+
+function grantCrystalBoost() {
+  state.crystals++;
+  for (const w of state.workers) {
+    if (w.dead) continue;
+    w.max += CONFIG.crystalHp;
+    w.hp = Math.min(w.max, w.hp + CONFIG.crystalHp);
+    if (w.pilot) {
+      w.pilot.max += CONFIG.crystalHp;
+      w.pilot.hp = Math.min(w.pilot.max, w.pilot.hp + CONFIG.crystalHp);
+    }
+  }
+  state.notice = 'Crystal collected! Units +' + CONFIG.crystalHp + ' HP & +' + Math.round(CONFIG.crystalDps * 100) + '% power!';
+  state.noticeT = 3.5;
+}
+
+function finishTile(x, y, team, byType) {
+  const c = cell(x, y), k = key(x, y);
+  if (team) state.ai.rubble += CONFIG.rubblePerTile;
+  else {
+    state.rubble += (c === 'H' || c === 'X') ? CONFIG.rubblePerTile * 2 : CONFIG.rubblePerTile;
+    if (byType === 'digger') state.rock += c === 'H' ? 2 : 1;
+  }
+  if (c === 'c' && !team) grantCrystalBoost();
+  if ((c === 'G' || c === 'E') && !team) state.won = true;
+  if (c === 'N' && team) { state.lost = true; state.lostWhy = 'nucleus'; }
+  state.grid[y][x] = '.';
+  state.marks.delete(k); state.ai.marks.delete(k);
+  delete state.hp[k];
+  // Reveal newly connected cave if player dug or if tile touches already-seen open space
+  if (!team || DIRS.some(([dx, dy]) => isSeen(x + dx, y + dy) && '.TBNWVE'.includes(cell(x + dx, y + dy) || ' '))) {
+    revealAround(x, y);
+  }
+  state.fx.push({ x, y, t: 0, big: false });
+  if (!state.lavaWarned && isSeen(x, y) && DIRS.some(([dx, dy]) => cell(x + dx, y + dy) === 'V')) {
+    state.lavaWarned = true;
+    state.notice = 'Lava exposed! It will slowly erode floor—dump gray rock walls to block it!'; state.noticeT = 4.5;
+  }
+  if (Math.random() < CONFIG.collapseChance) {
+    const near = [...state.workers, ...state.ai.workers].filter(o => !o.dead && ((o.job && o.job.x === x && o.job.y === y) || (o.job2 && o.job2.x === x && o.job2.y === y)));
+    if (near.length) {
+      near[Math.floor(Math.random() * near.length)].dead = true;
+      state.fx[state.fx.length - 1].big = true;
+      if (!team) { state.notice = 'Cave-in! A miner was lost.'; state.noticeT = 3; }
+    }
+  }
+  let roll = Math.random();
+  for (const m of CONFIG.moles) {
+    if (roll < m.p) {
+      state.moles.push({ x: x + 0.5, y: y + 0.5, s: m.s, hp: CONFIG.minerHp * m.s, max: CONFIG.minerHp * m.s, path: [], repath: 0, face: 0, lastHitBy: null });
+      if (isSeen(x, y)) {
+        state.notice = m.s >= 2 ? 'A giant mole boss burst out of the wall!' : 'A mole person burst out of the wall!';
+        state.noticeT = 3;
+      }
+      break;
+    }
+    roll -= m.p;
+  }
+  updateHud();
+}
+
+function findSecondJob(w, job) {
+  const M = marksOf(w), wx = Math.floor(w.x), wy = Math.floor(w.y);
+  const dx = job.x - wx, dy = job.y - wy;
+  if (Math.abs(dx) + Math.abs(dy) !== 1) return null;
+  const cands = dx !== 0 ? [[job.x, job.y - 1], [job.x, job.y + 1]] : [[job.x - 1, job.y], [job.x + 1, job.y]];
+  for (const [nx, ny] of cands) {
+    if (canDigTile(w, nx, ny) && M.has(key(nx, ny))) return { x: nx, y: ny };
+  }
+  return null;
+}
+
+function collectItem(w, dr) {
+  if (dr.kind === 'pick') {
+    if ((w.pickTier || 0) >= dr.tier) return false;
+    w.pickTier = dr.tier;
+    state.notice = 'Miner picked up a ' + (dr.tier === 2 ? 'Golden' : 'Crystal') + ' pickaxe!';
+    state.noticeT = 3.5;
+  } else {
+    state.rubble += dr.amount;
+    state.notice = 'Collected +' + dr.amount + ' rubble!';
+    state.noticeT = 2.5;
+  }
+  const idx = state.drops.indexOf(dr);
+  if (idx >= 0) state.drops.splice(idx, 1);
+  updateHud();
+  return true;
+}
+
+// Dump trucks handle both Rock Walls / Filling Water (K Truck Bay) and Water Moats (P Water Plant)
+function stepTruck(w, dt) {
+  const cap = truckCap(w);
+  if (w.cargo <= 0) {
+    w.job = null;
+    const wantWater = state.waterMarks.size > 0 && state.water > 0 && hasBay('P');
+    const wantRock = state.dumpMarks.size > 0 && state.rock > 0 && hasBay('K');
+    const loadKind = wantWater ? 'water' : wantRock ? 'rock' : (state.rock > 0 && hasBay('K')) ? 'rock' : (state.water > 0 && hasBay('P')) ? 'water' : null;
+    if (!loadKind) { w.path = []; w.loadT = 0; return; }
+    const bayType = loadKind === 'water' ? 'P' : 'K';
+    const bays = state.buildings.filter(b => b.type === bayType);
+    if (!bays.length) return;
+    const nearBay = bays.find(b => rectDist(w.x, w.y, b) <= 1.25);
+    if (nearBay) {
+      w.path = [];
+      w.face = Math.atan2(nearBay.y + 1 - w.y, nearBay.x + 1 - w.x);
+      w.loadT = (w.loadT || 0) + dt;
+      if (w.loadT >= 0.45) {
+        w.loadT = 0;
+        if (loadKind === 'water') {
+          const take = Math.min(cap, state.water);
+          state.water -= take; w.cargo = take; w.cargoType = 'water';
+        } else {
+          const take = Math.min(cap, state.rock);
+          state.rock -= take; w.cargo = take; w.cargoType = 'rock';
+        }
+        updateHud();
+      }
+      return;
+    }
+    w.repath = (w.repath || 0) - dt;
+    if (w.repath <= 0 || !w.path.length) {
+      w.repath = 0.5;
+      const goals = new Set();
+      for (const b of bays) for (let j = -1; j <= 2; j++) for (let i = -1; i <= 2; i++) {
+        if (i >= 0 && i <= 1 && j >= 0 && j <= 1) continue;
+        if (isFloor(b.x + i, b.y + j)) goals.add(key(b.x + i, b.y + j));
+      }
+      w.path = pathToGoal(Math.floor(w.x), Math.floor(w.y), goals) || [];
+    }
+    walk(w, dt);
+    return;
+  }
+
+  const isW = w.cargoType === 'water';
+  const D = isW ? state.waterMarks : state.dumpMarks;
+  const validTgt = (u, nx, ny) => isW ? cell(nx, ny) === '.' : isDumpTarget(nx, ny);
+
+  if (w.job && (!D.has(key(w.job.x, w.job.y)) || !validTgt(w, w.job.x, w.job.y))) { w.job = null; w.path = []; w.dumpT = 0; }
+  if (!w.job) {
+    const taken = new Set(state.workers.filter(o => o !== w && o.type === 'truck' && o.job).map(o => key(o.job.x, o.job.y)));
+    const f = findJob(w, k => !!D.get(k) && D.get(k).has(w.id), validTgt)
+      || findJob(w, k => D.has(k) && D.get(k) === null && !taken.has(k), validTgt)
+      || findJob(w, k => D.has(k) && !taken.has(k), validTgt)
+      || findJob(w, k => D.has(k), validTgt);
+    if (!f) return;
+    w.job = f.job; w.path = f.path; w.dumpT = 0;
+  }
+  if (w.path.length) {
+    walk(w, dt);
+  } else {
+    const wx = Math.floor(w.x), wy = Math.floor(w.y);
+    if (Math.abs(w.job.x - wx) + Math.abs(w.job.y - wy) !== 1) { w.job = null; w.dumpT = 0; return; }
+    w.face = Math.atan2(w.job.y + 0.5 - w.y, w.job.x + 0.5 - w.x);
+    const occupied = [...state.workers, ...state.ai.workers, ...state.moles].some(o => !o.dead && Math.floor(o.x) === w.job.x && Math.floor(o.y) === w.job.y);
+    if (occupied) return;
+    const dumpDur = 0.9 / (1 + 0.25 * (w.lvl || 0));
+    w.dumpT = (w.dumpT || 0) + dt;
+    if (w.dumpT >= dumpDur) {
+      w.dumpT = 0;
+      w.cargo -= 1;
+      const { x, y } = w.job, k = key(x, y);
+      if (isW) {
+        state.grid[y][x] = 'W';
+        delete state.erode[k];
+      } else if (cell(x, y) === 'W') {
+        state.grid[y][x] = '.'; // filling in water turns it into walkable ground
+        revealAround(x, y);
+      } else {
+        state.grid[y][x] = 'H'; // dumping rock builds gray rock wall
+        delete state.erode[k];
+      }
+      D.delete(k);
+      state.fx.push({ x, y, t: 0, big: false });
+      w.job = null;
+      updateHud();
+    }
+  }
+}
+
+function stepWorker(w, dt) {
+    if (w.dead) return;
+    const veh = w.type === 'laser' || w.type === 'flyer';
+    if (veh && !w.pilot) return;
+    if (w.target) {
+      if (w.target.dead || w.target.hp <= 0) { w.target = null; w.path = []; }
+      else {
+        const range = unitRange(w), d = Math.hypot(w.target.x - w.x, w.target.y - w.y);
+        w.face = Math.atan2(w.target.y - w.y, w.target.x - w.x);
+        if (d < range && (range < 2 || clear(w.x, w.y, w.target.x, w.target.y))) return;
+        if (w.type === 'flyer') {
+          const step = unitSpeed(w) * dt, dx = w.target.x - w.x, dy = w.target.y - w.y, dist = Math.hypot(dx, dy) || 1;
+          const nx = w.x + dx / dist * step, ny = w.y + dy / dist * step;
+          if (isFly(Math.floor(nx), Math.floor(ny))) { w.x = nx; w.y = ny; }
+          else if (isFly(Math.floor(nx), Math.floor(w.y))) w.x = nx;
+          else if (isFly(Math.floor(w.x), Math.floor(ny))) w.y = ny;
+        } else {
+          w.repath = (w.repath || 0) - dt;
+          if (w.repath <= 0) {
+            w.repath = 0.4;
+            w.path = pathToGoal(Math.floor(w.x), Math.floor(w.y), new Set([key(Math.floor(w.target.x), Math.floor(w.target.y))])) || [];
+          }
+          if (w.path.length) walk(w, dt);
+          else if (d > 0.2) {
+            const step = unitSpeed(w) * dt, dx = w.target.x - w.x, dy = w.target.y - w.y;
+            const nx = w.x + dx / d * step, ny = w.y + dy / d * step;
+            if (isFloor(Math.floor(nx), Math.floor(ny))) { w.x = nx; w.y = ny; }
+          }
+        }
+        return;
+      }
+    }
+    if (w.collect && w.type === 'dwarf') {
+      const dr = w.collect;
+      if (!state.drops.includes(dr)) { w.collect = null; w.path = []; }
+      else {
+        const d = Math.hypot(dr.x - w.x, dr.y - w.y);
+        if (d < 0.75) {
+          if (!collectItem(w, dr)) { state.notice = 'Miner already has an equal or better pickaxe.'; state.noticeT = 2.5; }
+          w.collect = null; w.path = []; return;
+        }
+        w.repath = (w.repath || 0) - dt;
+        if (w.repath <= 0) {
+          w.repath = 0.4;
+          const p = pathToGoal(Math.floor(w.x), Math.floor(w.y), new Set([key(Math.floor(dr.x), Math.floor(dr.y))]));
+          if (!p) { w.collect = null; state.notice = 'Miner cannot reach that item.'; state.noticeT = 2.5; return; }
+          w.path = p;
+        }
+        if (w.path.length) walk(w, dt);
+        else { const dx = dr.x - w.x, dy = dr.y - w.y, st = Math.min(unitSpeed(w) * dt, d); w.x += dx / d * st; w.y += dy / d * st; }
+        return;
+      }
+    }
+    if (w.type === 'truck') { stepTruck(w, dt); return; }
+    if (veh) { drive(w, dt); if (w.dest) return; if (w.type === 'laser' && w.fighting) return; }
+    if (w.fighting && !veh) return;
+    if (w.board != null) { boardStep(w, dt); return; }
+    if (w.job && (!marksOf(w).has(key(w.job.x, w.job.y)) || !canDigTile(w, w.job.x, w.job.y))) { w.job = null; w.job2 = null; w.path = []; }
+    if (w.job2 && (!marksOf(w).has(key(w.job2.x, w.job2.y)) || !canDigTile(w, w.job2.x, w.job2.y))) w.job2 = null;
+    if (!w.job) {
+      const M = marksOf(w), mates = w.team ? state.ai.workers : state.workers;
+      const taken = new Set(mates.filter(o => o !== w && o.job).map(o => key(o.job.x, o.job.y)));
+      const f = findJob(w, k => !!M.get(k) && M.get(k).has(w.id))
+        || findJob(w, k => M.has(k) && M.get(k) === null && !taken.has(k))
+        || findJob(w, k => M.has(k) && !taken.has(k))
+        || findJob(w, k => M.has(k));
+      if (!f) { if (w.type === 'laser' && !w.fighting) w.beam = null; return; }
+      w.job = f.job; w.job2 = null; w.path = f.path;
+    }
+    if (w.path.length) {
+      walk(w, dt);
+    } else {
+      const wx = Math.floor(w.x), wy = Math.floor(w.y);
+      if (Math.abs(w.job.x - wx) + Math.abs(w.job.y - wy) !== 1) { w.job = null; w.job2 = null; return; }
+      w.face = Math.atan2(w.job.y + 0.5 - w.y, w.job.x + 0.5 - w.x);
+      const pickMult = w.type === 'dwarf' ? 1 + (w.pickTier || 0) * 0.6 : 1;
+      const lvlMult = 1 + 0.4 * (w.lvl || 0);
+      const digRate = CONFIG.types[w.type].dig * pickMult * lvlMult;
+      const { x, y } = w.job, k = key(x, y);
+      if (w.type === 'laser') w.beam = { x: x + 0.5, y: y + 0.5, mining: true };
+      if (state.hp[k] === undefined) state.hp[k] = hpMax(cell(x, y));
+      state.hp[k] -= dt * digRate;
+      if (w.type === 'digger') {
+        if (!w.job2) w.job2 = findSecondJob(w, w.job);
+        if (w.job2) {
+          const k2 = key(w.job2.x, w.job2.y);
+          if (state.hp[k2] === undefined) state.hp[k2] = hpMax(cell(w.job2.x, w.job2.y));
+          state.hp[k2] -= dt * digRate;
+          if (state.hp[k2] <= 0) { finishTile(w.job2.x, w.job2.y, w.team, w.type); w.job2 = null; }
+        }
+      }
+      if (state.hp[k] <= 0) {
+        finishTile(x, y, w.team, w.type);
+        if (w.type === 'laser') w.beam = null;
+        if (w.job2) {
+          const next = w.job2; w.job = next; w.job2 = null;
+          if (Math.abs(next.x - wx) + Math.abs(next.y - wy) !== 1 && isFloor(x, y)) w.path = [[x, y]];
+        } else {
+          w.job = null;
+        }
+      }
+    }
+}
+
+function aiThink() {
+  const A = state.ai, w0 = A.workers.find(o => !o.dead);
+  if (!w0) return;
+  const sx = Math.floor(w0.x), sy = Math.floor(w0.y);
+  if (!A.tele && A.rubble >= CONFIG.teleCost && cell(sx, sy) === '.') {
+    state.grid[sy][sx] = 'T'; A.tele = { x: sx, y: sy }; A.rubble -= CONFIG.teleCost;
+  } else if (A.tele && A.rubble >= CONFIG.minerCost && A.workers.length < CONFIG.aiMaxMiners) {
+    A.rubble -= CONFIG.minerCost; addWorker(A.tele.x + 0.5, A.tele.y + 0.5, 1);
+  }
+  if (A.marks.size >= 2 || !state.nuc) return;
+  const seen = new Set([key(sx, sy)]), q = [[sx, sy]];
+  let best = null, bs = Infinity;
+  for (let i = 0; i < q.length; i++) {
+    const [x, y] = q[i];
+    for (const [dx, dy] of DIRS) {
+      const nx = x + dx, ny = y + dy, k = key(nx, ny);
+      if (isFloor(nx, ny)) { if (!seen.has(k)) { seen.add(k); q.push([nx, ny]); } continue; }
+      if ('#cN'.includes(cell(nx, ny) || ' ') && !A.marks.has(k)) {
+        const sc = Math.abs(nx - state.nuc[0]) + Math.abs(ny - state.nuc[1]) + Math.random() * CONFIG.aiSloppy;
+        if (sc < bs) { bs = sc; best = k; }
+      }
+    }
+  }
+  if (best) A.marks.set(best, null);
+}
+
+function update(dt) {
+  if (editor.active || state.won || state.lost) return;
+  dt *= CONFIG.speed;
+  state.air -= CONFIG.airPerMiner * dwarves().length * dt;
+
+  // Oxygen generators & Water plants
+  const wMax = maxWaterCap();
+  for (const b of state.buildings) {
+    const lvl = b.lvl || 0;
+    if (b.type === 'O') {
+      if (state.air < CONFIG.airMax) {
+        if (b.fuel <= 0 && state.rubble >= 1) {
+          state.rubble -= 1;
+          b.fuel += CONFIG.o2RubbleTime * (1 + 0.25 * lvl);
+          updateHud();
+        }
+        if (b.fuel > 0) {
+          const used = Math.min(b.fuel, dt);
+          b.fuel -= used;
+          state.air = Math.min(CONFIG.airMax, state.air + CONFIG.o2Rate * (1 + 0.45 * lvl) * used);
+        }
+      }
+    } else if (b.type === 'P' && b.active !== false && state.water < wMax && state.rubble >= 1) {
+      b.workT = (b.workT || 0) + dt * (1 + 0.4 * lvl);
+      if (b.workT >= CONFIG.waterRubbleTime) {
+        b.workT = 0;
+        state.rubble -= 1;
+        state.water = Math.min(wMax, state.water + 1);
+        updateHud();
+      }
+    }
+  }
+  if (state.air <= 0) { state.air = 0; state.lost = true; state.lostWhy = 'air'; updateHud(); return; }
+
+  const rows = state.grid.length, cols = state.grid[0].length;
+  const exposed = new Set();
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    if (state.grid[y][x] !== '.') continue;
+    if (DIRS.some(([dx, dy]) => cell(x + dx, y + dy) === 'V')) {
+      const k = key(x, y);
+      exposed.add(k);
+      state.erode[k] = (state.erode[k] || 0) + dt;
+      if (state.erode[k] >= CONFIG.lavaErodeTime) {
+        state.grid[y][x] = 'V';
+        delete state.erode[k];
+        state.fx.push({ x, y, t: 0, big: false });
+        for (const o of [...state.workers, ...state.ai.workers]) {
+          if (!o.dead && o.type !== 'flyer' && Math.floor(o.x) === x && Math.floor(o.y) === y) {
+            o.dead = true;
+            if (!o.team && isSeen(x, y)) { state.notice = 'Lava eroded the floor under a unit!'; state.noticeT = 3; }
+          }
+        }
+      }
+    }
+  }
+  for (const k in state.erode) if (!exposed.has(k)) delete state.erode[k];
+
+  for (const f of state.fx) f.t += dt;
+  state.fx = state.fx.filter(f => f.t < 0.6);
+  if (state.noticeT > 0) { state.noticeT -= dt; if (state.noticeT <= 0) updateHud(); }
+  if (state.ai.active) { state.ai.t += dt; if (state.ai.t >= CONFIG.aiThink) { state.ai.t = 0; aiThink(); } }
+
+  const all = [...state.workers, ...state.ai.workers].filter(o => !o.dead);
+  for (const w of all) {
+    w.fighting = false;
+    const ty = CONFIG.types[w.type], range = unitRange(w);
+    if (w.type === 'truck' || ((w.type === 'laser' || w.type === 'flyer') && !w.pilot)) { w.beam = null; continue; }
+    let tgt = null, best = range;
+    if (w.target && !w.target.dead && w.target.hp > 0) {
+      const d = Math.hypot(w.target.x - w.x, w.target.y - w.y);
+      if (d < range && (range < 2 || clear(w.x, w.y, w.target.x, w.target.y))) tgt = w.target;
+    }
+    if (!tgt) {
+      for (const o of all) {
+        if (o.team === w.team) continue;
+        const d = Math.hypot(o.x - w.x, o.y - w.y);
+        if (d < best && (range < 2 || clear(w.x, w.y, o.x, o.y))) { best = d; tgt = o; }
+      }
+      if (!tgt) {
+        best = range;
+        for (const m of state.moles) {
+          const d = Math.hypot(m.x - w.x, m.y - w.y);
+          if (d < best && (range < 2 || clear(w.x, w.y, m.x, m.y))) { best = d; tgt = m; }
+        }
+      }
+      if (!tgt && w.team) for (const b of state.buildings) { if (b.type !== 'O') continue; const d = rectDist(w.x, w.y, b); if (d < best) { best = d; tgt = b; } }
+    }
+    if (tgt) {
+      let dps = ty.dps * (1 + 0.45 * (w.lvl || 0)) * (w.team ? 1 : 1 + state.crystals * CONFIG.crystalDps);
+      if (w.type === 'dwarf' && w.pickTier) dps *= 1 + 0.4 * w.pickTier;
+      tgt.hp -= dps * dt;
+      if (!w.team && tgt.s !== undefined) tgt.lastHitBy = w.id;
+      w.fighting = true; w.beam = range > 2 ? { x: tgt.x, y: tgt.y } : null;
+    } else if (!(w.type === 'laser' && w.beam && w.beam.mining)) {
+      w.beam = null;
+    }
+  }
+
+  const goals = new Set(all.map(o => key(Math.floor(o.x), Math.floor(o.y))));
+  for (const b of state.buildings) if (b.type === 'O') for (let j = -1; j <= 2; j++) for (let i = -1; i <= 2; i++)
+    if ((i >= 0 && i <= 1) !== (j >= 0 && j <= 1) && isFloor(b.x + i, b.y + j)) goals.add(key(b.x + i, b.y + j));
+  for (const m of state.moles) {
+    let near = null, nd = Infinity;
+    for (const w of all) { const d = Math.hypot(m.x - w.x, m.y - w.y); if (d < nd) { nd = d; near = w; } }
+    if (near && nd < CONFIG.melee) { near.hp -= CONFIG.minerDps * m.s * dt; continue; }
+    let hit = null;
+    for (const b of state.buildings) if (b.type === 'O' && rectDist(m.x, m.y, b) < 0.6) hit = b;
+    if (hit) { hit.hp -= CONFIG.minerDps * m.s * dt; continue; }
+    m.repath -= dt;
+    if (m.repath <= 0) { m.repath = 0.4; m.path = pathToGoal(Math.floor(m.x), Math.floor(m.y), goals) || []; }
+    let gx = null, gy = null, fromPath = false;
+    if (m.path.length) { gx = m.path[0][0] + 0.5; gy = m.path[0][1] + 0.5; fromPath = true; }
+    else if (near && nd < 1.6) { gx = near.x; gy = near.y; }
+    if (gx !== null) {
+      const dx = gx - m.x, dy = gy - m.y, d = Math.hypot(dx, dy), step = CONFIG.moleSpeed * dt;
+      m.face = Math.atan2(dy, dx);
+      if (d <= step) { m.x = gx; m.y = gy; if (fromPath) m.path.shift(); } else { m.x += dx / d * step; m.y += dy / d * step; }
+    }
+  }
+  for (const w of all) if (w.hp <= 0 && !w.dead) { w.dead = true; if (!w.team) { state.notice = 'A unit was lost.'; state.noticeT = 3; } }
+  for (const m of state.moles) if (m.hp <= 0) {
+    state.fx.push({ x: Math.floor(m.x), y: Math.floor(m.y), t: 0, big: false });
+    if (m.s >= 1.0) {
+      const tier = m.s >= 2.0 ? 2 : 1;
+      const killer = state.workers.find(o => o.id === m.lastHitBy && !o.dead && o.type === 'dwarf' && (o.pickTier || 0) < tier);
+      if (killer && Math.hypot(killer.x - m.x, killer.y - m.y) < 1.5) {
+        killer.pickTier = tier;
+        state.notice = 'Miner got a ' + (tier === 2 ? 'Golden' : 'Crystal') + ' pickaxe!'; state.noticeT = 3.5;
+      } else {
+        state.drops.push({ kind: 'pick', x: m.x, y: m.y, tier });
+        state.notice = 'A mole dropped a ' + (tier === 2 ? 'Golden' : 'Crystal') + ' pickaxe!'; state.noticeT = 3.5;
+      }
+    } else {
+      state.drops.push({ kind: 'rubble', x: m.x, y: m.y, amount: 2 });
+    }
+  }
+  state.moles = state.moles.filter(m => m.hp > 0);
+  state.drops = state.drops.filter(dr => {
+    for (const w of state.workers) {
+      if (w.dead || w.type !== 'dwarf') continue;
+      if (Math.hypot(w.x - dr.x, w.y - dr.y) < 0.7) {
+        if (dr.kind === 'pick' && (w.pickTier || 0) >= dr.tier) continue;
+        if (collectItem(w, dr)) return false;
+      }
+    }
+    return true;
+  });
+  if (state.buildings.some(b => b.type === 'O' && b.hp <= 0)) {
+    for (const b of state.buildings) if (b.type === 'O' && b.hp <= 0) {
+      if (state.selBuilding === b) state.selBuilding = null;
+      for (const j of [0, 1]) for (const i of [0, 1]) state.grid[b.y + j][b.x + i] = '.';
+      state.fx.push({ x: b.x, y: b.y, t: 0, big: true });
+      state.notice = 'Your oxygen producer was destroyed!'; state.noticeT = 4;
+    }
+    state.buildings = state.buildings.filter(b => !(b.type === 'O' && b.hp <= 0)); updateHud();
+  }
+  for (const w of state.workers) stepWorker(w, dt);
+  for (const w of state.ai.workers) stepWorker(w, dt);
+  const dead = state.workers.filter(o => o.dead);
+  if (dead.length) {
+    dead.forEach(o => state.selected.delete(o.id));
+    for (const o of dead) if (o.pilot && !o.boarded && isFloor(Math.floor(o.x), Math.floor(o.y))) {
+      addWorker(o.x, o.y, 0, 'dwarf');
+      const nw = state.workers[state.workers.length - 1];
+      nw.hp = Math.max(1, o.pilot.hp); nw.max = o.pilot.max; nw.pickTier = o.pilot.pickTier || 0;
+    }
+    state.lostMiners += dead.filter(o => !o.boarded).length;
+    state.workers = state.workers.filter(o => !o.dead);
+    updateHud();
+  }
+  state.ai.workers = state.ai.workers.filter(o => !o.dead);
+  const canRecover = state.tele ? state.rubble >= CONFIG.minerCost : state.rubble >= CONFIG.teleCost + CONFIG.minerCost;
+  if (!state.workers.length && !canRecover) { state.lost = true; state.lostWhy = 'miners'; updateHud(); }
+}
+
+function updateHud() {
+  const last = levelIdx + 1 >= LEVELS.length;
+  $('title').textContent = customLevel ? ('Custom: ' + customLevel.name) : ('Dig prototype: level ' + (levelIdx + 1) + ' of ' + LEVELS.length + (LEVELS[levelIdx].ai ? ' (boss)' : ''));
+  $('rubble').textContent = '' + state.rubble;
+  $('rock').textContent = '' + state.rock;
+  $('water').textContent = '' + state.water;
+  $('count').textContent = state.crystals + '/' + state.total;
+  $('miners').textContent = '' + dwarves().length;
+  $('diggers').textContent = '' + countType('digger');
+  $('lasers').textContent = '' + countType('laser');
+  $('flyers').textContent = '' + countType('flyer');
+  $('trucks').textContent = '' + countType('truck');
+  $('units').textContent = totalUnits() + '/' + CONFIG.maxUnits;
+  $('build').hidden = !!state.tele;
+  $('build').disabled = state.rubble < CONFIG.teleCost || !!state.tele;
+  $('call').hidden = !state.tele;
+  $('call').disabled = !state.tele || state.rubble < CONFIG.minerCost || totalUnits() >= CONFIG.maxUnits;
+  for (const t of ['D', 'L', 'F', 'K', 'O', 'P']) {
+    const has = t !== 'O' && t !== 'P' && state.buildings.some(b => b.type === t), el = $('bay' + t);
+    if (!el) continue;
+    el.disabled = state.rubble < (has ? CONFIG.makeCost[t] : CONFIG.bayCost[t]) || (t === 'O' && state.buildings.filter(b => b.type === 'O').length >= CONFIG.o2Max) || (has && totalUnits() >= CONFIG.maxUnits);
+  }
+  $('next').hidden = !state.won;
+  $('next').textContent = customLevel ? 'Back to Editor' : last ? 'Play again' : 'Next level';
+  $('msg').textContent = state.lost ? (state.lostWhy === 'air' ? 'Out of air. Press Restart to try again.' : state.lostWhy === 'nucleus' ? 'Your nucleus was destroyed. Press Restart to try again.' : 'All your units are gone. Press Restart to try again.')
+    : state.won ? (customLevel ? 'Custom level cleared!' : last ? 'Goal crystal destroyed. Last level cleared!' : 'Goal crystal destroyed. Level cleared!')
+    : state.noticeT > 0 ? state.notice
+    : state.building === 'tele' ? 'Tap an open floor tile to place the teleporter.'
+    : state.building ? 'Tap the top-left tile of a free 2 by 2 floor area.'
+    : state.selBuilding ? (BAY[state.selBuilding.type].name.toUpperCase() + ' Lv' + (state.selBuilding.lvl || 0) + '/3 selected — tap ▲ to upgrade.')
+    : state.selected.size ? state.selected.size + ' of ' + state.workers.length + ' units selected.' : '';
+}
+
+function updateAir() {
+  let activeO2Rate = 0;
+  for (const b of state.buildings) {
+    if (b.type === 'O' && (b.fuel > 0 || state.rubble >= 1)) activeO2Rate += CONFIG.o2Rate * (1 + 0.45 * (b.lvl || 0));
+  }
+  const rate = (CONFIG.airPerMiner * dwarves().length - activeO2Rate) * CONFIG.speed;
+  $('airtxt').textContent = (rate > 0 ? '−' : '+') + Math.abs(rate).toFixed(2);
+}
+
+// ---- Drawing ----
+function gem(px, py, r, fill, stroke) {
+  const cx = px + T / 2, cy = py + T / 2;
+  ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.beginPath(); ctx.ellipse(cx + 2, cy + r * 0.8, r * 0.8, r * 0.3, 0, 0, 6.28); ctx.fill();
+  ctx.fillStyle = fill; ctx.strokeStyle = stroke || 'transparent'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(cx, cy - r); ctx.lineTo(cx + r * 0.75, cy); ctx.lineTo(cx, cy + r); ctx.lineTo(cx - r * 0.75, cy);
+  ctx.closePath(); ctx.fill(); if (stroke) ctx.stroke(); ctx.lineWidth = 1;
+  ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.beginPath(); ctx.moveTo(cx, cy - r); ctx.lineTo(cx - r * 0.75, cy); ctx.lineTo(cx, cy); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + r * 0.75, cy); ctx.lineTo(cx, cy + r); ctx.closePath(); ctx.fill();
+}
+
+function drawTeleporter(px, py, now) {
+  const cx = px + T / 2, cy = py + T / 2, pulse = (now / 400) % 6.28;
+  ctx.fillStyle = '#24303a'; ctx.beginPath(); ctx.arc(cx, cy, 16, 0, 6.28); ctx.fill();
+  ctx.strokeStyle = '#5f7688'; ctx.lineWidth = 2; ctx.stroke(); ctx.lineWidth = 1;
+  ctx.strokeStyle = '#4fd8ff'; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.arc(cx, cy, 12, pulse, pulse + 4.4); ctx.stroke();
+  ctx.fillStyle = 'rgba(79,216,255,' + (0.45 + 0.25 * Math.sin(now / 180)) + ')';
+  ctx.beginPath(); ctx.arc(cx, cy, 7, 0, 6.28); ctx.fill();
+  for (let i = 0; i < 3; i++) {
+    const a = i * 2.094 - 1.57;
+    ctx.fillStyle = '#9fdcf0'; ctx.beginPath(); ctx.arc(cx + Math.cos(a) * 14, cy + Math.sin(a) * 14, 2.5, 0, 6.28); ctx.fill();
+  }
+  ctx.lineWidth = 1;
+}
+
+function draw(now) {
+  const grid = editor.active ? editor.grid : state.grid;
+  const rows = grid.length, cols = grid[0].length, FACE = 12;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = '#0b0907'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(cam.z, 0, 0, cam.z, -cam.x * cam.z, -cam.y * cam.z);
+  const vx0 = Math.max(0, Math.floor(cam.x / T) - 1), vy0 = Math.max(0, Math.floor(cam.y / T) - 1);
+  const vx1 = Math.min(cols - 1, Math.ceil((cam.x + canvas.width / cam.z) / T) + 1), vy1 = Math.min(rows - 1, Math.ceil((cam.y + canvas.height / cam.z) / T) + 1);
+  const vis = (x, y) => editor.active || isSeen(x, y);
+  const raised = (x, y) => vis(x, y) && '#HXcG'.includes(grid[y] && grid[y][x] ? grid[y][x] : ' ');
+  const rockTex = (c, x, y) => (c === 'X' ? BEDROCK : c === 'H' ? HARD_ROCK : ROCK)[(x * 7 + y * 13) % 4];
+  for (let y = vy0; y <= vy1; y++) for (let x = vx0; x <= vx1; x++) {
+    const px = x * T, py = y * T;
+    if (!vis(x, y)) { ctx.fillStyle = '#070605'; ctx.fillRect(px, py, T, T); continue; }
+    const c = grid[y][x];
+    if (c === 'W' || c === 'V') drawLiquid(c, px, py, now);
+    else ctx.drawImage('.NTEB'.includes(c) ? FLOOR[(x + y) % 2] : rockTex(c, x, y), px, py);
+    if (!editor.active) {
+      const ek = state.erode[key(x, y)];
+      if (ek && c === '.') {
+        const f = Math.min(1, ek / CONFIG.lavaErodeTime);
+        ctx.fillStyle = 'rgba(255,95,20,' + (0.12 + f * 0.48) + ')'; ctx.fillRect(px, py, T, T);
+        ctx.strokeStyle = 'rgba(255,150,40,' + (0.3 + f * 0.6) + ')'; ctx.strokeRect(px + 2, py + 2, T - 4, T - 4);
+      }
+    }
+  }
+  for (let y = vy0; y <= vy1; y++) for (let x = vx0; x <= vx1; x++) {
+    if (!raised(x, y)) continue;
+    const c = grid[y][x], px = x * T, py = y * T; let g;
+    if (y + 1 < rows && vis(x, y + 1) && !raised(x, y + 1)) {
+      ctx.drawImage(rockTex(c, x, y), 0, 0, T, FACE, px, py + T, T, FACE);
+      g = ctx.createLinearGradient(0, py + T, 0, py + T + FACE); g.addColorStop(0, 'rgba(0,0,0,0.45)'); g.addColorStop(1, 'rgba(0,0,0,0.8)');
+      ctx.fillStyle = g; ctx.fillRect(px, py + T, T, FACE);
+      g = ctx.createLinearGradient(0, py + T + FACE, 0, py + T + FACE + 16); g.addColorStop(0, 'rgba(0,0,0,0.4)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g; ctx.fillRect(px, py + T + FACE, T, 16);
+    }
+    if (x + 1 < cols && vis(x + 1, y) && !raised(x + 1, y)) {
+      g = ctx.createLinearGradient(px + T, 0, px + T + 10, 0); g.addColorStop(0, 'rgba(0,0,0,0.35)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g; ctx.fillRect(px + T, py, 10, T);
+    }
+  }
+  for (let y = vy0; y <= vy1; y++) {
+    for (let x = vx0; x <= vx1; x++) {
+      if (!vis(x, y)) continue;
+      const c = grid[y][x], px = x * T, py = y * T, k = key(x, y);
+      if (c === 'c') gem(px, py, 12, '#4fd8ff');
+      if (c === 'G') gem(px, py, 16, '#ff4fa3', '#ffd0e6');
+      if (c === 'N') gem(px, py, 16, '#8a7cff', '#ffffff');
+      if (c === 'E') gem(px, py, 16, '#ff3b3b', '#ffd0d0');
+      if (c === 'T') drawTeleporter(px, py, now);
+      if (!editor.active) {
+        if (state.marks.has(k)) {
+          ctx.strokeStyle = c === 'X' ? '#d46bff' : c === 'H' ? '#ff9f43' : '#ffd23f'; ctx.lineWidth = 3; ctx.setLineDash([6, 4]);
+          ctx.strokeRect(px + 3, py + 3, T - 6, T - 6);
+          ctx.setLineDash([]); ctx.lineWidth = 1;
+          const m = state.marks.get(k);
+          if (m) { let i = 0; for (const id of m) { const w = state.workers.find(o => o.id === id); if (w) { ctx.fillStyle = w.color; ctx.fillRect(px + 5 + i * 8, py + 5, 6, 6); i++; } } }
+        }
+        if (state.dumpMarks.has(k)) {
+          ctx.strokeStyle = '#7dff9b'; ctx.lineWidth = 2.5; ctx.setLineDash([4, 4]);
+          ctx.strokeRect(px + 4, py + 4, T - 8, T - 8); ctx.setLineDash([]); ctx.lineWidth = 1;
+          ctx.fillStyle = 'rgba(138,148,158,0.7)'; ctx.fillRect(px + 13, py + 14, 14, 12);
+          ctx.strokeStyle = '#c4cdd6'; ctx.strokeRect(px + 13, py + 14, 14, 12);
+        }
+        if (state.waterMarks.has(k)) {
+          ctx.strokeStyle = '#4fd8ff'; ctx.lineWidth = 2.5; ctx.setLineDash([4, 4]);
+          ctx.strokeRect(px + 4, py + 4, T - 8, T - 8); ctx.setLineDash([]); ctx.lineWidth = 1;
+          ctx.fillStyle = 'rgba(45,140,210,0.65)'; ctx.beginPath(); ctx.arc(px + T / 2, py + T / 2, 7, 0, 6.28); ctx.fill();
+        }
+      }
+    }
+  }
+  if (editor.active) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    for (let y = vy0; y <= vy1 + 1; y++) { ctx.beginPath(); ctx.moveTo(vx0 * T, y * T); ctx.lineTo((vx1 + 1) * T, y * T); ctx.stroke(); }
+    for (let x = vx0; x <= vx1 + 1; x++) { ctx.beginPath(); ctx.moveTo(x * T, vy0 * T); ctx.lineTo(x * T, (vy1 + 1) * T); ctx.stroke(); }
+    for (const [sx, sy] of editor.spawns) {
+      ctx.fillStyle = 'rgba(79,216,255,0.3)'; ctx.fillRect(sx * T + 3, sy * T + 3, T - 6, T - 6);
+      ctx.strokeStyle = '#4fd8ff'; ctx.lineWidth = 2; ctx.strokeRect(sx * T + 3, sy * T + 3, T - 6, T - 6); ctx.lineWidth = 1;
+      ctx.fillStyle = '#ffffff'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('P', (sx + 0.5) * T, (sy + 0.5) * T + 5); ctx.textAlign = 'left';
+    }
+    for (const [ax, ay] of editor.aiSpawns) {
+      ctx.fillStyle = 'rgba(255,90,90,0.3)'; ctx.fillRect(ax * T + 3, ay * T + 3, T - 6, T - 6);
+      ctx.strokeStyle = '#ff5a5a'; ctx.lineWidth = 2; ctx.strokeRect(ax * T + 3, ay * T + 3, T - 6, T - 6); ctx.lineWidth = 1;
+      ctx.fillStyle = '#ffffff'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('A', (ax + 0.5) * T, (ay + 0.5) * T + 5); ctx.textAlign = 'left';
+    }
+    return;
+  }
+
+  const d = state.drag;
+  if (d) {
+    const x0 = Math.min(d.x0, d.x1), x1 = Math.max(d.x0, d.x1), y0 = Math.min(d.y0, d.y1), y1 = Math.max(d.y0, d.y1);
+    const colFill = d.erase ? 'rgba(255,90,90,0.25)' : d.mode === 'water' ? 'rgba(79,216,255,0.25)' : d.mode === 'dump' ? 'rgba(125,255,155,0.25)' : 'rgba(255,210,63,0.25)';
+    const colStroke = d.erase ? '#ff5a5a' : d.mode === 'water' ? '#4fd8ff' : d.mode === 'dump' ? '#7dff9b' : '#ffd23f';
+    ctx.fillStyle = colFill; ctx.fillRect(x0 * T, y0 * T, (x1 - x0 + 1) * T, (y1 - y0 + 1) * T);
+    ctx.strokeStyle = colStroke; ctx.lineWidth = 2;
+    ctx.strokeRect(x0 * T + 1, y0 * T + 1, (x1 - x0 + 1) * T - 2, (y1 - y0 + 1) * T - 2); ctx.lineWidth = 1;
+  }
+  for (const k in state.hp) {
+    const [x, y] = k.split(',').map(Number);
+    if (!vis(x, y)) continue;
+    const frac = 1 - state.hp[k] / hpMax(cell(x, y));
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(x * T + 4, y * T + T - 9, T - 8, 5);
+    ctx.fillStyle = cell(x, y) === 'X' ? '#d46bff' : cell(x, y) === 'H' ? '#ffb84d' : '#7dff9b';
+    ctx.fillRect(x * T + 4, y * T + T - 9, (T - 8) * frac, 5);
+  }
+  for (const f of state.fx) {
+    if (!vis(f.x, f.y)) continue;
+    ctx.fillStyle = 'rgba(205,190,165,' + 0.5 * (1 - f.t / 0.6) + ')';
+    ctx.beginPath(); ctx.arc((f.x + 0.5) * T, (f.y + 0.5) * T, 10 + f.t * (f.big ? 60 : 35), 0, Math.PI * 2); ctx.fill();
+  }
+  const collecting = new Set(state.workers.filter(o => o.collect).map(o => o.collect));
+  for (const dr of state.drops) if (vis(Math.floor(dr.x), Math.floor(dr.y))) drawDrop(dr, now, collecting.has(dr));
+  for (const b of state.buildings) drawBuilding(b, now);
+  if (state.selBuilding) {
+    const b = state.selBuilding;
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2.5; ctx.setLineDash([6, 4]);
+    ctx.strokeRect(b.x * T - 2, b.y * T - 2, T * 2 + 4, T * 2 + 4);
+    ctx.setLineDash([]); ctx.lineWidth = 1;
+  }
+  const targeted = new Set(state.workers.filter(o => o.target).map(o => o.target));
+  for (const m of state.moles) {
+    if (!vis(Math.floor(m.x), Math.floor(m.y))) continue;
+    if (targeted.has(m)) drawTargetRing(m.x * T, m.y * T, now);
+    drawMole(m);
+  }
+  for (const w of [...state.workers, ...state.ai.workers]) {
+    if (w.team && !vis(Math.floor(w.x), Math.floor(w.y))) continue;
+    if (targeted.has(w)) drawTargetRing(w.x * T, w.y * T, now);
+    (w.type === 'dwarf' ? dwarf : machine)(w, now);
+    if (w.hp < w.max) hpBar(w.x * T, w.y * T - 22, w.hp / w.max);
+  }
+}
+
+function drawTargetRing(cx, cy, now) {
+  const pulse = 1 + 0.12 * Math.sin(now / 120);
+  ctx.strokeStyle = '#ff3b3b'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.ellipse(cx, cy + 8, 15 * pulse, 7 * pulse, 0, 0, 6.28); ctx.stroke();
+  ctx.lineWidth = 1;
+}
+
+function drawDrop(dr, now, ordered) {
+  const cx = dr.x * T, cy = dr.y * T + Math.sin(now / 180) * 3;
+  if (ordered) {
+    const p = 1 + 0.14 * Math.sin(now / 120);
+    ctx.strokeStyle = '#7dff9b'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.ellipse(cx, dr.y * T + 5, 13 * p, 6 * p, 0, 0, 6.28); ctx.stroke(); ctx.lineWidth = 1;
+  }
+  if (dr.kind === 'rubble') {
+    ctx.fillStyle = 'rgba(255,210,63,0.22)'; ctx.beginPath(); ctx.arc(cx, cy, 9, 0, 6.28); ctx.fill();
+    ctx.fillStyle = '#7a6350'; ctx.beginPath(); ctx.arc(cx - 3, cy + 1, 4, 0, 6.28); ctx.arc(cx + 3, cy + 2, 3.5, 0, 6.28); ctx.arc(cx, cy - 3, 3.5, 0, 6.28); ctx.fill();
+    ctx.fillStyle = '#9e846c'; ctx.fillRect(cx - 2, cy - 4, 2, 2); ctx.fillRect(cx + 2, cy, 2, 2);
+    return;
+  }
+  const head = dr.tier === 2 ? '#ffd23f' : '#5ce1ff';
+  const glow = dr.tier === 2 ? 'rgba(255,210,63,0.35)' : 'rgba(92,225,255,0.35)';
+  ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(cx, cy - 2, 11, 0, 6.28); ctx.fill();
+  ctx.save(); ctx.translate(cx, cy + 5); ctx.rotate(-0.4);
+  ctx.strokeStyle = '#8a5a2b'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -13); ctx.stroke();
+  ctx.strokeStyle = head; ctx.lineWidth = 3.5; ctx.beginPath(); ctx.moveTo(-6, -13); ctx.lineTo(6, -13); ctx.stroke();
+  ctx.restore(); ctx.lineWidth = 1;
+}
+
+function dwarf(w, now) {
+  const cx = w.x * T, digging = w.job && !w.path.length;
+  const y = w.y * T + (w.path.length ? Math.sin(now / 90 + w.id) * 1.5 : 0);
+  if (state.selected.has(w.id)) { ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.ellipse(cx, w.y * T + 10, 13, 6, 0, 0, 6.28); ctx.stroke(); ctx.lineWidth = 1; }
+  ctx.fillStyle = '#3b2a1e'; ctx.fillRect(cx - 5, y + 6, 4, 5); ctx.fillRect(cx + 1, y + 6, 4, 5);
+  ctx.fillStyle = w.team ? '#8a3b3b' : '#5b6f8a'; ctx.fillRect(cx - 7, y - 4, 14, 11);
+  ctx.fillStyle = '#2b1c10'; ctx.fillRect(cx - 7, y + 2, 14, 2);
+  ctx.fillStyle = '#f0c8a0'; ctx.beginPath(); ctx.arc(cx, y - 8, 5.5, 0, 6.28); ctx.fill();
+  ctx.fillStyle = w.beard; ctx.beginPath();
+  ctx.moveTo(cx - 6, y - 8); ctx.lineTo(cx + 6, y - 8); ctx.lineTo(cx + 4, y + 4); ctx.lineTo(cx, y + 8); ctx.lineTo(cx - 4, y + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#e0a37e'; ctx.beginPath(); ctx.arc(cx, y - 8, 1.6, 0, 6.28); ctx.fill();
+  ctx.fillStyle = '#1b1b1b'; ctx.fillRect(cx - 3, y - 11, 1.5, 1.5); ctx.fillRect(cx + 1.5, y - 11, 1.5, 1.5);
+  ctx.fillStyle = w.color; ctx.beginPath(); ctx.arc(cx, y - 10, 6.5, Math.PI, 0); ctx.fill();
+  ctx.fillRect(cx - 7.5, y - 10.5, 15, 2);
+  ctx.fillStyle = '#fff3a0'; ctx.beginPath(); ctx.arc(cx, y - 15, 1.8, 0, 6.28); ctx.fill();
+  ctx.save(); ctx.translate(cx + 8, y + 2);
+  ctx.rotate(digging || w.fighting ? -0.9 + Math.sin(now / 110 + w.id) * 0.9 : -0.5);
+  ctx.strokeStyle = w.pickTier === 2 ? '#c47f17' : w.pickTier === 1 ? '#4a7a96' : '#8a5a2b';
+  ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -14); ctx.stroke();
+  ctx.strokeStyle = w.pickTier === 2 ? '#ffd23f' : w.pickTier === 1 ? '#5ce1ff' : '#c9ced3';
+  ctx.lineWidth = w.pickTier ? 3.5 : 3; ctx.beginPath(); ctx.moveTo(-5, -14); ctx.lineTo(5, -14); ctx.stroke();
+  ctx.restore(); ctx.lineWidth = 1;
+  ctx.fillStyle = '#f0c8a0'; ctx.beginPath(); ctx.arc(cx + 8, y + 2, 2, 0, 6.28); ctx.fill();
+}
+
+const BAY = { D: { name: 'digger', type: 'digger', color: '#e09218' }, L: { name: 'laser', type: 'laser', color: '#d94444' },
+  F: { name: 'flyer', type: 'flyer', color: '#3fb8e0' }, K: { name: 'truck', type: 'truck', color: '#6aa84f' },
+  O: { name: 'oxygen producer', type: null, color: '#37c9a5' }, P: { name: 'water plant', type: null, color: '#2b8cbe' } };
+
+function drawLiquid(c, px, py, now) {
+  const lava = c === 'V', t = now / 600;
+  ctx.fillStyle = lava ? '#6d1906' : '#12384f'; ctx.fillRect(px, py, T, T);
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = lava ? 'rgba(255,170,40,0.55)' : 'rgba(150,215,255,0.35)';
+    ctx.fillRect(px + 3 + (i * 9) % 12, py + 8 + i * 12 + Math.sin(t + px * 0.1 + i) * 3, 18, 3);
+  }
+  if (lava) { ctx.fillStyle = 'rgba(255,90,20,' + (0.18 + 0.1 * Math.sin(t * 2 + px)) + ')'; ctx.fillRect(px, py, T, T); }
+  ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.strokeRect(px + 0.5, py + 0.5, T - 1, T - 1);
+}
+
+function drawBuilding(b, now) {
+  const px = b.x * T, py = b.y * T, w = T * 2, cx = px + T, cy = py + T, lvl = b.lvl || 0;
+  ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(px + 4, py + 6, w - 4, w - 4);
+  ctx.fillStyle = '#262b30'; ctx.fillRect(px + 2, py + 2, w - 4, w - 4);
+  ctx.strokeStyle = lvl ? TIER_COLORS[lvl] : '#4a545e'; ctx.lineWidth = lvl ? 2.5 : 2;
+  ctx.strokeRect(px + 3, py + 3, w - 6, w - 6); ctx.lineWidth = 1;
+
+  if (b.type === 'D') {
+    ctx.fillStyle = '#33383e'; ctx.fillRect(px + 6, py + 6, w - 12, w - 12);
+    for (let i = 0; i < 6; i++) {
+      ctx.fillStyle = i % 2 === 0 ? '#e89b1e' : '#1b1d20';
+      ctx.fillRect(px + 8 + i * 11, py + w - 13, 11, 6);
+      ctx.fillRect(px + 8 + i * 11, py + 7, 11, 5);
+    }
+    ctx.fillStyle = '#5f6873'; ctx.fillRect(px + 10, py + 15, 6, w - 30); ctx.fillRect(px + w - 16, py + 15, 6, w - 30);
+    ctx.fillStyle = lvl ? TIER_COLORS[lvl] : '#e89b1e'; ctx.fillRect(px + 8, cy - 6, w - 16, 8);
+    ctx.fillStyle = '#b9c2cc';
+    ctx.beginPath(); ctx.moveTo(cx - 14, cy + 4); ctx.lineTo(cx - 4, cy + 4); ctx.lineTo(cx - 9, cy + 17); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(cx + 4, cy + 4); ctx.lineTo(cx + 14, cy + 4); ctx.lineTo(cx + 9, cy + 17); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#ffb838'; ctx.beginPath(); ctx.arc(px + 13, py + 18, 3, 0, 6.28); ctx.fill();
+  } else if (b.type === 'L') {
+    ctx.fillStyle = '#201e24'; ctx.fillRect(px + 6, py + 6, w - 12, w - 12);
+    ctx.strokeStyle = '#622a32'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(px + 10, py + 10); ctx.lineTo(px + w - 10, py + w - 10);
+    ctx.moveTo(px + w - 10, py + 10); ctx.lineTo(px + 10, py + w - 10); ctx.stroke(); ctx.lineWidth = 1;
+    for (const [ox, oy] of [[11, 11], [w - 11, 11], [11, w - 11], [w - 11, w - 11]]) {
+      ctx.fillStyle = '#474c54'; ctx.fillRect(px + ox - 5, py + oy - 5, 10, 10);
+      ctx.fillStyle = '#5ce1ff'; ctx.beginPath(); ctx.arc(px + ox, py + oy, 2.5, 0, 6.28); ctx.fill();
+    }
+    ctx.fillStyle = '#992c34'; ctx.beginPath(); ctx.arc(cx, cy, 18, 0, 6.28); ctx.fill();
+    ctx.fillStyle = lvl ? TIER_COLORS[lvl] : '#d94444'; ctx.beginPath(); ctx.arc(cx, cy, 13, 0, 6.28); ctx.fill();
+    ctx.fillStyle = '#24262b'; ctx.fillRect(cx - 3, cy - 22, 6, 16);
+    ctx.fillStyle = '#8ff'; ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 6.28); ctx.fill();
+  } else if (b.type === 'F') {
+    ctx.fillStyle = '#1f3342'; ctx.fillRect(px + 6, py + 6, w - 12, w - 12);
+    ctx.fillStyle = '#294c66'; ctx.beginPath(); ctx.arc(cx, cy, 27, 0, 6.28); ctx.fill();
+    ctx.strokeStyle = lvl ? TIER_COLORS[lvl] : '#6ad4ff'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]); ctx.stroke(); ctx.setLineDash([]); ctx.lineWidth = 1;
+    ctx.fillStyle = '#bfefff';
+    ctx.fillRect(cx - 12, cy - 13, 4, 26); ctx.fillRect(cx + 8, cy - 13, 4, 26); ctx.fillRect(cx - 12, cy - 2, 24, 4);
+    const on = Math.sin(now / 220) > 0;
+    ctx.fillStyle = on ? '#7dff9b' : '#2a5a3a';
+    for (const [ox, oy] of [[11, 11], [w - 11, 11], [11, w - 11], [w - 11, w - 11]]) {
+      ctx.beginPath(); ctx.arc(px + ox, py + oy, 3, 0, 6.28); ctx.fill();
+    }
+    ctx.fillStyle = '#d0e8f5'; ctx.fillRect(px + w - 15, py + 6, 3, 10);
+  } else if (b.type === 'K') {
+    ctx.fillStyle = '#2b3129'; ctx.fillRect(px + 6, py + 6, w - 12, w - 12);
+    ctx.fillStyle = '#4f5e48'; ctx.fillRect(px + 9, py + 10, w - 18, 18);
+    ctx.fillStyle = '#7e8690'; ctx.beginPath(); ctx.arc(cx - 8, py + 19, 5, 0, 6.28); ctx.arc(cx + 2, py + 18, 6, 0, 6.28); ctx.arc(cx + 10, py + 20, 4.5, 0, 6.28); ctx.fill();
+    ctx.fillStyle = lvl ? TIER_COLORS[lvl] : '#6aa84f'; ctx.fillRect(cx - 14, cy + 4, 28, 16);
+    ctx.fillStyle = '#232629'; ctx.fillRect(cx - 12, cy + 20, 6, 5); ctx.fillRect(cx + 6, cy + 20, 6, 5);
+    ctx.fillStyle = '#a3b39c'; ctx.fillRect(cx - 10, cy + 7, 20, 4);
+  } else if (b.type === 'P') {
+    // Water Plant: blue reservoir basin with animated ripples, intake pipes, and H2O badge
+    const on = b.active !== false && state.rubble >= 1 && state.water < maxWaterCap();
+    ctx.fillStyle = '#182b3a'; ctx.fillRect(px + 6, py + 6, w - 12, w - 12);
+    ctx.fillStyle = '#235c82'; ctx.beginPath(); ctx.arc(cx, cy + 2, 23, 0, 6.28); ctx.fill();
+    ctx.strokeStyle = lvl ? TIER_COLORS[lvl] : '#4fd8ff'; ctx.lineWidth = 2; ctx.stroke(); ctx.lineWidth = 1;
+    const rPulse = on ? 6 + ((now / 90) % 14) : 10;
+    ctx.strokeStyle = on ? 'rgba(140,230,255,0.65)' : 'rgba(140,230,255,0.25)';
+    ctx.beginPath(); ctx.arc(cx, cy + 2, rPulse, 0, 6.28); ctx.stroke();
+    ctx.fillStyle = '#5c6670'; ctx.fillRect(px + 8, py + 10, 12, 8); ctx.fillRect(px + w - 20, py + 10, 12, 8);
+    ctx.fillStyle = b.active === false ? '#ff8a3d' : '#b8f0ff'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(b.active === false ? 'OFF' : 'H₂O', cx, py + 15); ctx.textAlign = 'left';
+  } else if (b.type === 'O') {
+    const running = b.fuel > 0 || (state.rubble >= 1 && state.air < CONFIG.airMax);
+    ctx.fillStyle = '#1b3532'; ctx.fillRect(px + 6, py + 6, w - 12, w - 12);
+    for (const ox of [10, w - 24]) {
+      ctx.fillStyle = lvl ? TIER_COLORS[lvl] : '#2ea88c'; ctx.fillRect(px + ox, py + 12, 14, w - 24);
+      ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.fillRect(px + ox + 2, py + 14, 4, w - 28);
+      ctx.fillStyle = '#1a423a'; ctx.fillRect(px + ox, py + 24, 14, 3); ctx.fillRect(px + ox, py + w - 26, 14, 3);
+    }
+    ctx.fillStyle = '#182428'; ctx.beginPath(); ctx.arc(cx, cy, 16, 0, 6.28); ctx.fill();
+    ctx.strokeStyle = running ? '#4fffe0' : '#ff9f43'; ctx.lineWidth = 2; ctx.stroke(); ctx.lineWidth = 1;
+    ctx.save(); ctx.translate(cx, cy);
+    ctx.rotate(running ? (now / 140) % 6.28 : 0.4);
+    ctx.fillStyle = running ? '#b8fff2' : '#7a8a88';
+    for (let i = 0; i < 4; i++) { ctx.rotate(Math.PI / 2); ctx.fillRect(-2, -12, 4, 10); }
+    ctx.restore();
+    ctx.fillStyle = running ? '#d8fff4' : '#ff9f43'; ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('O₂', cx, py + 15);
+    if (!running && state.rubble < 1) {
+      ctx.fillStyle = '#ffae42'; ctx.font = 'bold 9px sans-serif'; ctx.fillText('NO RUBBLE', cx, py + w - 8);
+    }
+    ctx.textAlign = 'left';
+    if (b.hp < b.max) hpBar(cx, py - 6, b.hp / b.max, '#ff5a5a');
+  }
+  for (let i = 0; i < lvl; i++) {
+    ctx.fillStyle = TIER_COLORS[lvl];
+    ctx.beginPath(); ctx.arc(px + 9 + i * 7, py + 9, 2.5, 0, 6.28); ctx.fill();
+  }
+}
+
+function machine(w, now) {
+  const cx = w.x * T, cy = w.y * T, t = w.type, lvl = w.lvl || 0, wide = t === 'digger';
+  const accent = TIER_COLORS[lvl] || BAY[t === 'digger' ? 'D' : t === 'laser' ? 'L' : t === 'flyer' ? 'F' : 'K'].color;
+  if (state.selected.has(w.id)) {
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.ellipse(cx, cy + 12, wide ? 22 : 15, wide ? 11 : 7, 0, 0, 6.28); ctx.stroke(); ctx.lineWidth = 1;
+  }
+  if ((t === 'laser' || t === 'flyer') && !w.pilot) {
+    ctx.strokeStyle = 'rgba(255,210,63,' + (0.4 + 0.3 * Math.sin(now / 250)) + ')'; ctx.setLineDash([4, 3]);
+    ctx.beginPath(); ctx.ellipse(cx, cy + 10, 16, 8, 0, 0, 6.28); ctx.stroke(); ctx.setLineDash([]);
+  }
+  ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.beginPath(); ctx.ellipse(cx, cy + 12, wide ? 19 : t === 'flyer' ? 8 : 12, wide ? 9 : t === 'flyer' ? 3 : 5, 0, 0, 6.28); ctx.fill();
+  if (wide) {
+    const digging = w.job && !w.path.length;
+    const spin = digging ? (now / 45) % 6 : 0;
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(w.face || 0);
+    ctx.fillStyle = '#202226'; ctx.fillRect(-16, -15, 24, 6); ctx.fillRect(-16, 9, 24, 6);
+    ctx.fillStyle = '#474b54';
+    for (let tx = -14; tx < 8; tx += 5) { ctx.fillRect(tx, -15, 2, 6); ctx.fillRect(tx, 9, 2, 6); }
+    ctx.fillStyle = accent; ctx.fillRect(-15, -10, 22, 20);
+    ctx.fillStyle = 'rgba(255,255,255,0.28)'; ctx.fillRect(-13, -8, 18, 4);
+    ctx.fillStyle = '#232528'; ctx.fillRect(-16, -9, 3, 18);
+    ctx.fillStyle = accent; ctx.fillRect(-16, -6, 3, 4); ctx.fillRect(-16, 2, 3, 4);
+    ctx.fillStyle = '#3c454d'; ctx.fillRect(-6, -6, 10, 12);
+    ctx.fillStyle = '#8ee2fa'; ctx.fillRect(-2, -5, 5, 10);
+    ctx.fillStyle = '#6c737c'; ctx.fillRect(-17, -7, 4, 2); ctx.fillRect(-17, 5, 4, 2);
+    ctx.fillStyle = '#5c636d'; ctx.fillRect(7, -13, 4, 26);
+    for (const dy of [-7, 7]) {
+      ctx.fillStyle = lvl === 3 ? '#ffe07d' : '#8d96a0';
+      ctx.beginPath(); ctx.moveTo(11, dy - 5); ctx.lineTo(24, dy); ctx.lineTo(11, dy + 5); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = '#eef3f8'; ctx.lineWidth = 1.5;
+      for (let s = 0; s < 3; s++) {
+        const sx = 12 + ((s * 4 + spin) % 10), frac = 1 - (sx - 11) / 13;
+        ctx.beginPath(); ctx.moveTo(sx, dy - 4.5 * frac); ctx.lineTo(sx + 1.5, dy + 4.5 * frac); ctx.stroke();
+      }
+      ctx.lineWidth = 1;
+    }
+    ctx.restore();
+    if (digging && w.job2) {
+      ctx.strokeStyle = 'rgba(255,210,63,0.75)'; ctx.lineWidth = 2;
+      ctx.strokeRect(w.job.x * T + 2, w.job.y * T + 2, T - 4, T - 4);
+      ctx.strokeRect(w.job2.x * T + 2, w.job2.y * T + 2, T - 4, T - 4);
+      ctx.lineWidth = 1;
+    }
+  } else if (t === 'truck') {
+    const dumping = w.dumpT > 0, cap = truckCap(w);
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(w.face || 0);
+    ctx.fillStyle = '#1b1d20';
+    ctx.fillRect(-13, -13, 7, 4); ctx.fillRect(4, -13, 7, 4);
+    ctx.fillRect(-13, 9, 7, 4); ctx.fillRect(4, 9, 7, 4);
+    ctx.fillStyle = accent; ctx.fillRect(3, -9, 10, 18);
+    ctx.fillStyle = '#9fe2fa'; ctx.fillRect(8, -7, 4, 14);
+    const tilt = dumping ? -4 : 0;
+    ctx.fillStyle = '#3b4248'; ctx.fillRect(-15 + tilt, -10, 17, 20);
+    ctx.strokeStyle = accent; ctx.lineWidth = 1.5; ctx.strokeRect(-15 + tilt, -10, 17, 20); ctx.lineWidth = 1;
+    if (w.cargo > 0) {
+      if (w.cargoType === 'water') {
+        ctx.fillStyle = '#3da6e0'; ctx.fillRect(-13 + tilt, -8, 13, 16);
+        ctx.fillStyle = 'rgba(200,245,255,0.5)'; ctx.fillRect(-11 + tilt, -5, 4, 10);
+      } else {
+        const rocksShown = Math.min(4, Math.ceil((w.cargo / cap) * 4));
+        const pts = [[-9, -4], [-5, 3], [-11, 4], [-5, -4]];
+        ctx.fillStyle = '#8b949e';
+        for (let i = 0; i < rocksShown; i++) {
+          ctx.beginPath(); ctx.arc(pts[i][0] + tilt, pts[i][1], 3.5, 0, 6.28); ctx.fill();
+        }
+      }
+    }
+    ctx.restore();
+    if (w.cargo > 0) {
+      ctx.fillStyle = w.cargoType === 'water' ? '#6be0ff' : '#d8dee6';
+      ctx.font = 'bold 9px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(w.cargo + '/' + cap, cx, cy + 20); ctx.textAlign = 'left';
+    }
+  } else if (t === 'laser') {
+    ctx.fillStyle = '#44464c'; ctx.fillRect(cx - 10, cy + 1, 20, 9);
+    ctx.fillStyle = accent; ctx.fillRect(cx - 7, cy - 9, 14, 11);
+    ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.fillRect(cx - 7, cy - 9, 14, 3);
+    ctx.fillStyle = '#8ff'; ctx.beginPath(); ctx.arc(cx, cy - 3, 3, 0, 6.28); ctx.fill();
+    if (w.pilot) { ctx.fillStyle = w.pilot.color; ctx.beginPath(); ctx.arc(cx, cy - 11, 4, Math.PI, 0); ctx.fill(); }
+    if (w.beam) {
+      ctx.strokeStyle = w.beam.mining ? '#c46bff' : (lvl ? accent : 'rgba(255,80,80,0.9)');
+      ctx.lineWidth = (w.beam.mining ? 3 : 2) + lvl * 0.5;
+      ctx.beginPath(); ctx.moveTo(cx, cy - 3); ctx.lineTo(w.beam.x * T, w.beam.y * T); ctx.stroke(); ctx.lineWidth = 1;
+    }
+  } else {
+    const y = cy - 8 + Math.sin(now / 200 + w.id) * 2;
+    ctx.fillStyle = accent; ctx.beginPath(); ctx.ellipse(cx, y, 11, 6, 0, 0, 6.28); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.4)'; ctx.beginPath(); ctx.ellipse(cx - 2, y - 2, 5, 2.5, 0, 0, 6.28); ctx.fill();
+    if (w.pilot) { ctx.fillStyle = w.pilot.color; ctx.beginPath(); ctx.arc(cx, y - 2, 4, Math.PI, 0); ctx.fill(); }
+    ctx.strokeStyle = '#e8f6ff'; ctx.lineWidth = 2; const a = w.pilot ? Math.cos(now / 40) * 15 : 4;
+    ctx.beginPath(); ctx.moveTo(cx - a, y - 7); ctx.lineTo(cx + a, y - 7); ctx.stroke(); ctx.lineWidth = 1;
+  }
+  if (lvl > 0) {
+    for (let i = 0; i < lvl; i++) {
+      ctx.fillStyle = TIER_COLORS[lvl]; ctx.fillRect(cx - (lvl * 4) / 2 + i * 5, cy - 20, 3, 3);
+    }
+  }
+  if (w.dest) { ctx.strokeStyle = 'rgba(79,216,255,0.8)'; ctx.beginPath(); ctx.arc(w.dest.x * T, w.dest.y * T, 8, 0, 6.28); ctx.stroke(); }
+}
+
+function vignette() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const W = canvas.width, H = canvas.height, g = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, W * 0.62);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.45)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+function clear(ax, ay, bx, by) {
+  for (let i = 1; i < 8; i++) { const t = i / 8; if ('#HXcG'.includes(cell(Math.floor(ax + (bx - ax) * t), Math.floor(ay + (by - ay) * t)) || ' ')) return false; }
+  return true;
+}
+
+function placeBay(x, y) {
+  const t = state.building;
+  if (state.rubble < CONFIG.bayCost[t] || ![0, 1].every(j => [0, 1].every(i => cell(x + i, y + j) === '.'))
+    || [...state.workers, ...state.ai.workers, ...state.moles].some(o => !o.dead && o.x >= x && o.x < x + 2 && o.y >= y && o.y < y + 2)) {
+    state.notice = 'Needs a free 2 by 2 floor area with nobody standing on it, and enough rubble.'; state.noticeT = 3; return;
+  }
+  for (const j of [0, 1]) for (const i of [0, 1]) state.grid[y + j][x + i] = 'B';
+  state.buildings.push({ type: t, x, y, lvl: 0, hp: t === 'O' ? CONFIG.o2Hp : 0, max: t === 'O' ? CONFIG.o2Hp : 0, fuel: 0, active: true });
+  state.rubble -= CONFIG.bayCost[t];
+}
+
+function walk(w, dt) {
+  if (!w.path || !w.path.length) return;
+  const [tx, ty] = w.path[0], dx = tx + 0.5 - w.x, dy = ty + 0.5 - w.y, d = Math.hypot(dx, dy), step = unitSpeed(w) * dt;
+  if (d > 0.001) w.face = Math.atan2(dy, dx);
+  if (d <= step) { w.x = tx + 0.5; w.y = ty + 0.5; w.path.shift(); } else { w.x += dx / d * step; w.y += dy / d * step; }
+}
+
+function drive(w, dt) {
+  if (!w.dest) return;
+  const ox = w.x, oy = w.y;
+  const step = unitSpeed(w) * dt, dx = w.dest.x - w.x, dy = w.dest.y - w.y, d = Math.hypot(dx, dy);
+  if (w.type === 'flyer') {
+    if (d <= step) { w.x = w.dest.x; w.y = w.dest.y; w.dest = null; return; }
+    const nx = w.x + dx / d * step, ny = w.y + dy / d * step;
+    if (isFly(Math.floor(nx), Math.floor(ny))) { w.x = nx; w.y = ny; }
+    else if (isFly(Math.floor(nx), Math.floor(w.y))) w.x = nx;
+    else if (isFly(Math.floor(w.x), Math.floor(ny))) w.y = ny;
+    if (w.x === ox && w.y === oy) w.dest = null;
+    return;
+  }
+  w.repath = (w.repath || 0) - dt;
+  if (w.repath <= 0) {
+    w.repath = 0.5;
+    const p = pathToGoal(Math.floor(w.x), Math.floor(w.y), new Set([key(Math.floor(w.dest.x), Math.floor(w.dest.y))]));
+    if (!p) { w.dest = null; return; }
+    w.path = p;
+  }
+  if (w.path.length) { walk(w, dt); return; }
+  if (d <= step) { w.x = w.dest.x; w.y = w.dest.y; w.dest = null; } else { w.x += dx / d * step; w.y += dy / d * step; }
+}
+
+function boardStep(w, dt) {
+  const v = state.workers.find(o => o.id === w.board && !o.dead && !o.pilot);
+  if (!v) { w.board = null; return; }
+  if (Math.hypot(v.x - w.x, v.y - w.y) < 0.8) {
+    v.pilot = { id: w.id, hp: w.hp, max: w.max, color: w.color, beard: w.beard, pickTier: w.pickTier || 0 };
+    w.dead = true; w.boarded = true;
+    state.selected.delete(w.id); state.selected.add(v.id);
+    updateHud(); return;
+  }
+  w.repath = (w.repath || 0) - dt;
+  if (w.repath <= 0) {
+    w.repath = 0.5;
+    const p = pathToGoal(Math.floor(w.x), Math.floor(w.y), new Set([key(Math.floor(v.x), Math.floor(v.y))]));
+    if (!p) { w.board = null; state.notice = 'That miner cannot reach the vehicle.'; state.noticeT = 3; return; }
+    w.path = p;
+  }
+  if (w.path.length) walk(w, dt);
+  else { const dx = v.x - w.x, dy = v.y - w.y, d = Math.hypot(dx, dy) || 1, st = Math.min(unitSpeed(w) * dt, d); w.x += dx / d * st; w.y += dy / d * st; }
+}
+
+function rectDist(px, py, b) {
+  return Math.hypot(Math.max(b.x - px, 0, px - (b.x + 2)), Math.max(b.y - py, 0, py - (b.y + 2)));
+}
+
+function hpBar(cx, y, f, col) {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(cx - 11, y, 22, 4);
+  ctx.fillStyle = col || '#7dff9b'; ctx.fillRect(cx - 11, y, 22 * Math.max(0, f), 4);
+}
+
+function drawMole(m) {
+  const cx = m.x * T, cy = m.y * T, r = 7 + 3 * m.s;
+  const body = m.s >= 2 ? '#291a24' : m.s >= 1 ? '#5e3642' : '#7d6a58';
+  const snout = m.s >= 2 ? '#d96b78' : m.s >= 1 ? '#e38d98' : '#e8a0a8';
+  const claws = m.s >= 2 ? '#ffd23f' : m.s >= 1 ? '#d8e4ec' : '#f0d9a0';
+  const eyes = m.s >= 2 ? '#ff3030' : m.s >= 1 ? '#ffae33' : '#111111';
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(m.face);
+  ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.beginPath(); ctx.ellipse(0, 3, r, r * 0.8, 0, 0, 6.28); ctx.fill();
+  ctx.fillStyle = body; ctx.beginPath(); ctx.ellipse(0, 0, r, r * 0.85, 0, 0, 6.28); ctx.fill();
+  if (m.s >= 2) {
+    ctx.fillStyle = '#a82838'; ctx.beginPath(); ctx.ellipse(-r * 0.25, 0, r * 0.45, r * 0.35, 0, 0, 6.28); ctx.fill();
+  } else if (m.s >= 1) {
+    ctx.fillStyle = '#7e4a58'; ctx.beginPath(); ctx.ellipse(-r * 0.2, 0, r * 0.35, r * 0.28, 0, 0, 6.28); ctx.fill();
+  }
+  ctx.fillStyle = snout; ctx.beginPath(); ctx.arc(r, 0, 3 + m.s, 0, 6.28); ctx.fill();
+  ctx.fillStyle = claws; ctx.fillRect(r * 0.3, -r - 2, 5, 4); ctx.fillRect(r * 0.3, r - 2, 5, 4);
+  ctx.fillStyle = eyes; ctx.fillRect(r * 0.55, -3.5, 2.2, 2.2); ctx.fillRect(r * 0.55, 1.5, 2.2, 2.2);
+  ctx.restore();
+  if (m.hp < m.max) hpBar(cx, cy - r - 7, m.hp / m.max, '#ff5a5a');
+}
+
+// ---- HUD Sprite Icons ----
+function iconRubble(cx, cy) {
+  ctx.fillStyle = '#7a593f';
+  ctx.beginPath(); ctx.arc(cx - 3, cy + 2, 3.5, 0, 6.28); ctx.arc(cx + 3, cy + 2, 3, 0, 6.28); ctx.arc(cx, cy - 2, 3.5, 0, 6.28); ctx.fill();
+  ctx.fillStyle = '#a88363'; ctx.fillRect(cx - 1, cy - 3, 2, 2);
+}
+function iconRock(cx, cy) {
+  ctx.fillStyle = '#6f7782';
+  ctx.beginPath(); ctx.moveTo(cx - 5, cy + 4); ctx.lineTo(cx - 6, cy - 2); ctx.lineTo(cx - 1, cy - 6); ctx.lineTo(cx + 6, cy - 3); ctx.lineTo(cx + 5, cy + 4); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#9aa3af'; ctx.fillRect(cx - 3, cy - 4, 4, 2);
+}
+function iconWater(cx, cy) {
+  ctx.fillStyle = '#3da6e0';
+  ctx.beginPath(); ctx.moveTo(cx, cy - 7); ctx.quadraticCurveTo(cx + 6, cy + 1, cx + 4.5, cy + 4.5);
+  ctx.arc(cx, cy + 3, 4.5, 0.3, Math.PI - 0.3); ctx.quadraticCurveTo(cx - 6, cy + 1, cx, cy - 7); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.beginPath(); ctx.arc(cx - 1.5, cy + 2, 1.5, 0, 6.28); ctx.fill();
+}
+function iconCrystal(cx, cy) {
+  ctx.fillStyle = '#4fd8ff';
+  ctx.beginPath(); ctx.moveTo(cx, cy - 7); ctx.lineTo(cx + 5, cy); ctx.lineTo(cx, cy + 7); ctx.lineTo(cx - 5, cy); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.45)'; ctx.beginPath(); ctx.moveTo(cx, cy - 7); ctx.lineTo(cx - 5, cy); ctx.lineTo(cx, cy); ctx.closePath(); ctx.fill();
+}
+function iconUnit(type, cx, cy) {
+  ctx.save(); ctx.translate(cx, cy);
+  if (type === 'dwarf') {
+    ctx.fillStyle = '#5b6f8a'; ctx.fillRect(-4, 0, 8, 6);
+    ctx.fillStyle = '#f0c8a0'; ctx.beginPath(); ctx.arc(0, -3, 3.5, 0, 6.28); ctx.fill();
+    ctx.fillStyle = '#c8651b'; ctx.fillRect(-3.5, -2, 7, 5);
+    ctx.fillStyle = '#ff8a3d'; ctx.beginPath(); ctx.arc(0, -4.5, 4.2, Math.PI, 0); ctx.fill();
+  } else if (type === 'digger') {
+    ctx.fillStyle = '#202226'; ctx.fillRect(-8, -7, 11, 3); ctx.fillRect(-8, 4, 11, 3);
+    ctx.fillStyle = '#e09218'; ctx.fillRect(-7, -5, 10, 10);
+    ctx.fillStyle = '#8ee2fa'; ctx.fillRect(-2, -3, 3, 6);
+    ctx.fillStyle = '#9aa3af';
+    ctx.beginPath(); ctx.moveTo(3, -5); ctx.lineTo(9, -2.5); ctx.lineTo(3, 0); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(3, 0); ctx.lineTo(9, 2.5); ctx.lineTo(3, 5); ctx.closePath(); ctx.fill();
+  } else if (type === 'laser') {
+    ctx.fillStyle = '#44464c'; ctx.fillRect(-6, 2, 12, 5);
+    ctx.fillStyle = '#d94444'; ctx.fillRect(-5, -5, 10, 8);
+    ctx.fillStyle = '#8ff'; ctx.beginPath(); ctx.arc(0, -1, 2.2, 0, 6.28); ctx.fill();
+  } else if (type === 'flyer') {
+    ctx.fillStyle = '#3fb8e0'; ctx.beginPath(); ctx.ellipse(0, 0, 7, 4, 0, 0, 6.28); ctx.fill();
+    ctx.strokeStyle = '#e8f6ff'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(-8, -5); ctx.lineTo(8, -5); ctx.stroke(); ctx.lineWidth = 1;
+  } else if (type === 'truck') {
+    ctx.fillStyle = '#1b1d20'; ctx.fillRect(-7, -7, 4, 2); ctx.fillRect(2, -7, 4, 2); ctx.fillRect(-7, 5, 4, 2); ctx.fillRect(2, 5, 4, 2);
+    ctx.fillStyle = '#3b4248'; ctx.fillRect(-8, -5, 9, 10);
+    ctx.fillStyle = '#6aa84f'; ctx.fillRect(1, -5, 6, 10);
+    ctx.fillStyle = '#8b949e'; ctx.beginPath(); ctx.arc(-4, 0, 2.5, 0, 6.28); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ---- Level Creator & Saved Custom Levels ----
+const EDITOR_TILES = [
+  { ch: '.', name: 'Floor', col: '#2b2520' },
+  { ch: '#', name: 'Dirt', col: '#5a422f' },
+  { ch: 'H', name: 'Hard', col: '#767e88' },
+  { ch: 'X', name: 'Bedrock', col: '#31353d' },
+  { ch: 'c', name: 'Crystal', col: '#4fd8ff' },
+  { ch: 'G', name: 'Goal', col: '#ff4fa3' },
+  { ch: 'N', name: 'Nucleus', col: '#8a7cff' },
+  { ch: 'E', name: 'Boss', col: '#ff3b3b' },
+  { ch: 'W', name: 'Water', col: '#2d6c9a' },
+  { ch: 'V', name: 'Lava', col: '#e0561c' },
+  { ch: 'S', name: 'Spawn', col: '#6fd0ff' },
+  { ch: 'A', name: 'Enemy', col: '#ff6e6e' }
+];
+const EDITOR_SIZES = [[36, 24], [48, 32], [60, 40]];
+const editor = { active: false, grid: null, spawns: [], aiSpawns: [], tool: '#', brush: 1, sizeIdx: 0, name: 'Custom 1', savedOpen: false, painting: false };
+
+function loadSavedLevels() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; }
+}
+function writeSavedLevels(arr) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(arr)); } catch {}
+}
+function initEditorFromBlank(cols = 36, rows = 24) {
+  editor.grid = Array.from({ length: rows }, () => Array(cols).fill('#'));
+  for (let y = rows - 7; y < rows - 2; y++) for (let x = 2; x < 8; x++) editor.grid[y][x] = '.';
+  editor.grid[rows - 5][5] = 'N';
+  editor.grid[3][cols - 4] = 'G';
+  editor.spawns = [[3, rows - 6], [6, rows - 4]];
+  editor.aiSpawns = [];
+}
+function openEditor(fromLv) {
+  if (fromLv) {
+    editor.grid = fromLv.grid.map(r => r.split(''));
+    editor.spawns = (fromLv.spawns || []).map(p => [...p]);
+    editor.aiSpawns = (fromLv.ai && fromLv.ai.spawns ? fromLv.ai.spawns : []).map(p => [...p]);
+    editor.name = fromLv.name || 'Custom';
+  } else if (!editor.grid) {
+    initEditorFromBlank(...EDITOR_SIZES[editor.sizeIdx]);
+  }
+  editor.active = true; editor.savedOpen = false; buildOpen = false; makeOpen = false;
+  resize(); cam.z = DPR;
+  cam.x = 0; cam.y = 0; clampCam();
+}
+function paintEditorAt(tx, ty) {
+  const rows = editor.grid.length, cols = editor.grid[0].length, half = Math.floor(editor.brush / 2);
+  for (let dy = 0; dy < editor.brush; dy++) for (let dx = 0; dx < editor.brush; dx++) {
+    const x = tx - half + dx, y = ty - half + dy;
+    if (x < 0 || y < 0 || x >= cols || y >= rows) continue;
+    if (editor.tool === 'S') {
+      editor.grid[y][x] = '.';
+      if (!editor.spawns.some(([sx, sy]) => sx === x && sy === y)) editor.spawns.push([x, y]);
+      editor.aiSpawns = editor.aiSpawns.filter(([ax, ay]) => ax !== x || ay !== y);
+    } else if (editor.tool === 'A') {
+      editor.grid[y][x] = '.';
+      if (!editor.aiSpawns.some(([ax, ay]) => ax === x || ay === y)) editor.aiSpawns.push([x, y]);
+      editor.spawns = editor.spawns.filter(([sx, sy]) => sx !== x || sy !== y);
+    } else {
+      if (editor.tool === 'N' || editor.tool === 'G' || editor.tool === 'E') {
+        for (let ry = 0; ry < rows; ry++) for (let rx = 0; rx < cols; rx++) if (editor.grid[ry][rx] === editor.tool) editor.grid[ry][rx] = editor.tool === 'G' ? '#' : '.';
+      }
+      editor.grid[y][x] = editor.tool;
+      if (editor.tool !== '.') {
+        editor.spawns = editor.spawns.filter(([sx, sy]) => sx !== x || sy !== y);
+        editor.aiSpawns = editor.aiSpawns.filter(([ax, ay]) => ax !== x || ay !== y);
+      }
+    }
+  }
+}
+function buildLevelFromEditor() {
+  const g = editor.grid.map(r => r.join(''));
+  let spawns = editor.spawns.filter(([x, y]) => editor.grid[y] && editor.grid[y][x] === '.');
+  if (!spawns.length) {
+    outer: for (let y = 0; y < editor.grid.length; y++) for (let x = 0; x < editor.grid[0].length; x++) {
+      if (editor.grid[y][x] === '.') { spawns = [[x, y]]; break outer; }
+    }
+    if (!spawns.length) { editor.grid[2][2] = '.'; g[2] = editor.grid[2].join(''); spawns = [[2, 2]]; }
+  }
+  const hasGoal = editor.grid.some(r => r.includes('G') || r.includes('E'));
+  if (!hasGoal) {
+    editor.grid[2][editor.grid[0].length - 3] = 'G';
+    g[2] = editor.grid[2].join('');
+  }
+  const lv = { name: editor.name, grid: g, spawns, liquids: [] };
+  if (editor.aiSpawns.length || editor.grid.some(r => r.includes('E'))) {
+    let aiSp = editor.aiSpawns.filter(([x, y]) => editor.grid[y] && editor.grid[y][x] === '.');
+    if (!aiSp.length) {
+      outer2: for (let y = 0; y < editor.grid.length; y++) for (let x = editor.grid[0].length - 1; x >= 0; x--) {
+        if (editor.grid[y][x] === '.') { aiSp = [[x, y]]; break outer2; }
+      }
+    }
+    if (aiSp.length) lv.ai = { spawns: aiSp };
+  }
+  return lv;
+}
+function saveEditorLevel(asNew) {
+  const list = loadSavedLevels();
+  const lv = buildLevelFromEditor();
+  if (asNew) {
+    let n = list.length + 1;
+    while (list.some(o => o.name === 'Custom ' + n)) n++;
+    lv.name = 'Custom ' + n;
+    editor.name = lv.name;
+    list.push(lv);
+  } else {
+    const idx = list.findIndex(o => o.name === editor.name);
+    if (idx >= 0) list[idx] = lv;
+    else list.push(lv);
+  }
+  writeSavedLevels(list);
+}
+
+// ---- In-window interface ----
+let DPR = 1, helpOpen = true, buildOpen = false, makeOpen = false, miniOpen = true, miniDrag = false;
+const ui = { hit: [], mini: null, topH: 34, botH: 42, leftW: 38, rightW: 60 };
+const dom = id => $(id);
+const hasBay = t => state.buildings.some(b => b.type === t);
+const upgrCost = b => CONFIG.bayCost[b.type] * Math.pow(2, (b.lvl || 0) + 1);
+
+function upgradeSpecificBay(b) {
+  if (!b || (b.lvl || 0) >= 3) return;
+  const cost = upgrCost(b);
+  if (state.rubble < cost) { state.notice = 'Need ' + cost + ' rubble to upgrade.'; state.noticeT = 2.5; updateHud(); return; }
+  state.rubble -= cost;
+  b.lvl = (b.lvl || 0) + 1;
+  if (b.type === 'O') {
+    const addHp = Math.round(CONFIG.o2Hp * 0.5);
+    b.max += addHp; b.hp += addHp;
+  }
+  state.notice = 'Upgraded ' + BAY[b.type].name + (b.type === 'O' || b.type === 'P' ? '' : ' bay') + ' to Lv' + b.lvl + '!';
+  state.noticeT = 3;
+  updateHud();
+}
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width = Math.round(Math.max(200, canvas.clientWidth) * DPR); canvas.height = Math.round(Math.max(200, canvas.clientHeight) * DPR);
+  if (state) clampCam();
+}
+function rr(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function wrap(text, maxW) {
+  const out = []; let line = '';
+  for (const w of text.split(' ')) { const t = line ? line + ' ' + w : w; if (ctx.measureText(t).width > maxW && line) { out.push(line); line = w; } else line = t; }
+  if (line) out.push(line); return out;
+}
+function flow(list, W, bottom) {
+  const h = 28, g = 5, rows = [[]]; let x = 8;
+  for (const b of list) {
+    b.w = b.w || (Math.ceil(ctx.measureText(b.label).width) + 18); b.h = h;
+    if (x + b.w > W - 8 && rows[rows.length - 1].length) { rows.push([]); x = 8; }
+    b.x = x; x += b.w + g; rows[rows.length - 1].push(b);
+  }
+  rows.forEach((row, i) => row.forEach(b => { b.y = bottom - rows.length * (h + g) + i * (h + g) + g; }));
+  return rows.length * (h + g);
+}
+function barButtons() {
+  const b = [
+    { label: 'Select all', fn: () => dom('selall').click() },
+    { label: 'Buildings', fn: () => { buildOpen = !buildOpen; if (buildOpen) makeOpen = false; }, active: buildOpen },
+    { label: 'Make', fn: () => { makeOpen = !makeOpen; if (makeOpen) buildOpen = false; }, active: makeOpen },
+    { label: miniOpen ? 'Map: on' : 'Map: off', fn: () => { miniOpen = !miniOpen; }, active: miniOpen },
+    { label: dom('pan').textContent, fn: () => dom('pan').click(), active: panMode },
+    { label: '+', fn: () => dom('zin').click() }, { label: '−', fn: () => dom('zout').click() },
+    { label: 'Editor', fn: () => openEditor(customLevel || null) },
+    { label: '?', fn: () => { helpOpen = true; } },
+    { label: 'Restart', fn: () => dom('restart').click() }
+  ];
+  if (customLevel) b.push({ label: 'Campaign', fn: () => { customLevel = null; newGame(); } });
+  return b;
+}
+function startBuild(t) {
+  if (t === 'tele') {
+    if (state.tele || state.rubble < CONFIG.teleCost) return;
+    state.building = state.building === 'tele' ? false : 'tele';
+  } else {
+    if (state.rubble < CONFIG.bayCost[t]) return;
+    if (t === 'O' && state.buildings.filter(b => b.type === 'O').length >= CONFIG.o2Max) return;
+    state.building = state.building === t ? false : t;
+  }
+  state.selBuilding = null;
+  updateHud();
+}
+function makeUnit(t) {
+  if (totalUnits() >= CONFIG.maxUnits) { state.notice = 'Unit limit reached (' + CONFIG.maxUnits + '/' + CONFIG.maxUnits + ').'; state.noticeT = 3; updateHud(); return; }
+  if (state.rubble < CONFIG.makeCost[t]) return;
+  const bays = state.buildings.filter(o => o.type === t).sort((a, b) => (b.lvl || 0) - (a.lvl || 0));
+  for (const b of bays) {
+    for (let j = -1; j <= 2; j++) for (let i = -1; i <= 2; i++) {
+      if (i >= 0 && i <= 1 && j >= 0 && j <= 1) continue;
+      if (isFloor(b.x + i, b.y + j)) {
+        state.rubble -= CONFIG.makeCost[t];
+        addWorker(b.x + i + 0.5, b.y + j + 0.5, 0, BAY[t].type, b.lvl || 0);
+        if (t === 'L' || t === 'F') { state.notice = 'Select a miner, then tap the vehicle to climb in.'; state.noticeT = 4; }
+        else if (t === 'K') { state.notice = 'Select a Dump Truck and tap/drag floor, water, or lava.'; state.noticeT = 4; }
+        updateHud(); return;
+      }
+    }
+  }
+  state.notice = 'No free floor beside the bay.'; state.noticeT = 3; updateHud();
+}
+function buildButtons() {
+  const o2Full = state.buildings.filter(b => b.type === 'O').length >= CONFIG.o2Max;
+  return [
+    { label: state.tele ? 'Teleporter ✓' : 'Teleporter ' + CONFIG.teleCost, off: !!state.tele || state.rubble < CONFIG.teleCost, active: state.building === 'tele', fn: () => startBuild('tele') },
+    { label: 'Digger bay ' + CONFIG.bayCost.D, off: state.rubble < CONFIG.bayCost.D, active: state.building === 'D', fn: () => startBuild('D') },
+    { label: 'Laser bay ' + CONFIG.bayCost.L, off: state.rubble < CONFIG.bayCost.L, active: state.building === 'L', fn: () => startBuild('L') },
+    { label: 'Flyer bay ' + CONFIG.bayCost.F, off: state.rubble < CONFIG.bayCost.F, active: state.building === 'F', fn: () => startBuild('F') },
+    { label: 'Truck bay ' + CONFIG.bayCost.K, off: state.rubble < CONFIG.bayCost.K, active: state.building === 'K', fn: () => startBuild('K') },
+    { label: 'O₂ gen ' + CONFIG.bayCost.O, off: o2Full || state.rubble < CONFIG.bayCost.O, active: state.building === 'O', fn: () => startBuild('O') },
+    { label: 'Water plant ' + CONFIG.bayCost.P, off: state.rubble < CONFIG.bayCost.P, active: state.building === 'P', fn: () => startBuild('P') }
+  ];
+}
+function makeButtons() {
+  const full = totalUnits() >= CONFIG.maxUnits;
+  return [
+    { label: 'Call miner ' + CONFIG.minerCost, off: full || !state.tele || state.rubble < CONFIG.minerCost, fn: () => dom('call').click() },
+    { label: 'Make digger ' + CONFIG.makeCost.D, off: full || !hasBay('D') || state.rubble < CONFIG.makeCost.D, fn: () => makeUnit('D') },
+    { label: 'Make laser ' + CONFIG.makeCost.L, off: full || !hasBay('L') || state.rubble < CONFIG.makeCost.L, fn: () => makeUnit('L') },
+    { label: 'Make flyer ' + CONFIG.makeCost.F, off: full || !hasBay('F') || state.rubble < CONFIG.makeCost.F, fn: () => makeUnit('F') },
+    { label: 'Make truck ' + CONFIG.makeCost.K, off: full || !hasBay('K') || state.rubble < CONFIG.makeCost.K, fn: () => makeUnit('K') }
+  ];
+}
+function drawButtons(list) {
+  ctx.font = 'bold 12px system-ui, sans-serif'; ctx.textAlign = 'center';
+  for (const b of list) {
+    ctx.fillStyle = b.off ? 'rgba(40,40,46,0.85)' : b.active ? '#3fb8e0' : b.accent ? '#e0a030' : 'rgba(22,25,32,0.92)';
+    rr(b.x, b.y, b.w, b.h, 8); ctx.fill(); ctx.strokeStyle = b.swatch ? b.swatch : 'rgba(255,255,255,0.25)'; ctx.stroke();
+    if (b.swatch) { ctx.fillStyle = b.swatch; ctx.fillRect(b.x + 6, b.y + 7, 10, b.h - 14); }
+    ctx.fillStyle = b.off ? '#7d848b' : b.active || b.accent ? '#06121a' : '#ffffff';
+    ctx.fillText(b.label, b.x + b.w / 2 + (b.swatch ? 5 : 0), b.y + b.h / 2 + 1);
+    ui.hit.push({ x: b.x, y: b.y, w: b.w, h: b.h, fn: b.off ? () => {} : b.fn });
+  }
+  ctx.textAlign = 'left';
+}
+function miniGo(x, y) {
+  const m = ui.mini; if (!m) return;
+  cam.x = (x - m.x) / m.cell * T - canvas.width / cam.z / 2; cam.y = (y - m.y) / m.cell * T - canvas.height / cam.z / 2; clampCam();
+}
+
+function drawEditorUI(W, H, sans) {
+  const hudH = 34;
+  ui.topH = hudH; ui.leftW = 0; ui.rightW = 0;
+  ctx.fillStyle = 'rgba(12,14,18,0.88)'; ctx.fillRect(0, 0, W, hudH);
+  ui.hit.push({ x: 0, y: 0, w: W, h: hudH, fn: () => {} });
+  ctx.font = 'bold 13px ' + sans; ctx.fillStyle = '#ffffff';
+  ctx.fillText('Level Editor: ' + editor.name + ' (' + editor.grid[0].length + '×' + editor.grid.length + ')', 10, 17);
+  ctx.font = '12px ' + sans; ctx.fillStyle = '#9fb0bb'; ctx.textAlign = 'right';
+  ctx.fillText('Tap/drag to paint · 2-finger/right-drag to pan', W - 10, 17); ctx.textAlign = 'left';
+
+  ctx.font = 'bold 12px ' + sans;
+  const actions = [
+    { label: 'Play', accent: true, fn: () => { const lv = buildLevelFromEditor(); editor.active = false; newGame(lv); } },
+    { label: 'Save', fn: () => { saveEditorLevel(false); editor.savedOpen = true; } },
+    { label: 'Save As New', fn: () => { saveEditorLevel(true); editor.savedOpen = true; } },
+    { label: 'My Levels', active: editor.savedOpen, fn: () => { editor.savedOpen = !editor.savedOpen; } },
+    { label: 'Brush ' + editor.brush + '×' + editor.brush, fn: () => { editor.brush = editor.brush === 1 ? 2 : editor.brush === 2 ? 3 : 1; } },
+    { label: 'Size', fn: () => { editor.sizeIdx = (editor.sizeIdx + 1) % EDITOR_SIZES.length; initEditorFromBlank(...EDITOR_SIZES[editor.sizeIdx]); clampCam(); } },
+    { label: 'Clear', fn: () => initEditorFromBlank(...EDITOR_SIZES[editor.sizeIdx]) },
+    { label: dom('pan').textContent, active: panMode, fn: () => dom('pan').click() },
+    { label: 'Exit', fn: () => { editor.active = false; customLevel = null; newGame(); } }
+  ];
+  const palette = EDITOR_TILES.map(t => ({
+    label: t.name, swatch: t.col, w: Math.ceil(ctx.measureText(t.name).width) + 28,
+    active: editor.tool === t.ch, fn: () => { editor.tool = t.ch; }
+  }));
+  const actH = flow(actions, W, H - 4);
+  const palH = flow(palette, W, H - 4 - actH);
+  ui.botH = actH + palH + 4;
+  ctx.fillStyle = 'rgba(12,14,18,0.72)'; ctx.fillRect(0, H - ui.botH, W, ui.botH);
+  ui.hit.push({ x: 0, y: H - ui.botH, w: W, h: ui.botH, fn: () => {} });
+  drawButtons(palette); drawButtons(actions);
+
+  if (editor.savedOpen) {
+    const list = loadSavedLevels();
+    const pw = Math.min(440, W - 24), ph = Math.min(H - hudH - ui.botH - 24, Math.max(120, 68 + list.length * 36));
+    const px = (W - pw) / 2, py = hudH + 12;
+    ctx.fillStyle = 'rgba(14,17,22,0.96)'; rr(px, py, pw, ph, 10); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.28)'; ctx.stroke();
+    ui.hit.push({ x: px, y: py, w: pw, h: ph, fn: () => {} });
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 14px ' + sans; ctx.fillText('Saved Custom Levels (' + list.length + ')', px + 14, py + 20);
+    const closeB = { x: px + pw - 28, y: py + 8, w: 20, h: 20, label: '×', fn: () => { editor.savedOpen = false; } };
+    drawButtons([closeB]);
+    if (!list.length) {
+      ctx.fillStyle = '#9fb0bb'; ctx.font = '13px ' + sans; ctx.fillText('No saved levels yet. Click Save to store this map!', px + 14, py + 52);
+    } else {
+      const maxShow = Math.floor((ph - 44) / 36);
+      list.slice(0, maxShow).forEach((lv, idx) => {
+        const ry = py + 40 + idx * 36;
+        ctx.fillStyle = 'rgba(255,255,255,0.06)'; rr(px + 10, ry, pw - 20, 30, 6); ctx.fill();
+        ctx.fillStyle = '#e8ecef'; ctx.font = 'bold 12px ' + sans;
+        ctx.fillText(lv.name + ' (' + lv.grid[0].length + '×' + lv.grid.length + ')', px + 18, ry + 15);
+        const btns = [
+          { label: 'Play', x: px + pw - 196, y: ry + 2, w: 42, h: 26, accent: true, fn: () => { editor.active = false; editor.savedOpen = false; newGame(lv); } },
+          { label: 'Edit', x: px + pw - 150, y: ry + 2, w: 42, h: 26, fn: () => { openEditor(lv); } },
+          { label: 'Ren', x: px + pw - 104, y: ry + 2, w: 40, h: 26, fn: () => {
+            const nm = prompt('Rename level:', lv.name);
+            if (nm && nm.trim()) { lv.name = nm.trim(); if (editor.name === list[idx].name) editor.name = lv.name; writeSavedLevels(list); }
+          } },
+          { label: 'Del', x: px + pw - 60, y: ry + 2, w: 40, h: 26, fn: () => { list.splice(idx, 1); writeSavedLevels(list); } }
+        ];
+        ctx.font = 'bold 11px ' + sans; ctx.textAlign = 'center';
+        for (const b of btns) {
+          ctx.fillStyle = b.accent ? '#e0a030' : 'rgba(30,36,44,0.95)';
+          rr(b.x, b.y, b.w, b.h, 6); ctx.fill(); ctx.strokeStyle = 'rgba(255,255,255,0.22)'; ctx.stroke();
+          ctx.fillStyle = b.accent ? '#06121a' : '#ffffff'; ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+          ui.hit.push({ x: b.x, y: b.y, w: b.w, h: b.h, fn: b.fn });
+        }
+        ctx.textAlign = 'left';
+      });
+    }
+  }
+}
+
+function drawUI() {
+  const W = canvas.width / DPR, H = canvas.height / DPR, sans = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0); ctx.textBaseline = 'middle'; ctx.textAlign = 'left'; ui.hit = [];
+  if (editor.active) { drawEditorUI(W, H, sans); return; }
+
+  ui.leftW = 38; ui.rightW = 60;
+  const msg = dom('msg').textContent, over = state.won || state.lost;
+  if (over) { ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(0, 0, W, H); }
+
+  // Top bar: sprite icons + counts ONLY
+  const hudH = 34;
+  ui.topH = hudH;
+  ctx.fillStyle = 'rgba(12,14,18,0.85)'; ctx.fillRect(0, 0, W, hudH);
+  ui.hit.push({ x: 0, y: 0, w: W, h: hudH, fn: () => {} });
+  ctx.font = 'bold 13px ' + sans; ctx.fillStyle = '#f1f1f1';
+  let rx = 14;
+  iconRubble(rx, 17); ctx.fillText('' + state.rubble, rx + 11, 17); rx += ctx.measureText('' + state.rubble).width + 26;
+  iconRock(rx, 17); ctx.fillText('' + state.rock, rx + 11, 17); rx += ctx.measureText('' + state.rock).width + 26;
+  iconWater(rx, 17); ctx.fillText('' + state.water, rx + 10, 17); rx += ctx.measureText('' + state.water).width + 26;
+  iconCrystal(rx, 17);
+  const crysTxt = state.crystals + '/' + state.total + (state.crystals ? ' +' + (state.crystals * CONFIG.crystalHp) + 'HP' : '');
+  ctx.fillText(crysTxt, rx + 10, 17);
+  ctx.textAlign = 'right'; ctx.fillStyle = '#9fb0bb'; ctx.font = 'bold 12px ' + sans;
+  const lvlTxt = customLevel ? customLevel.name : ('Lv ' + (levelIdx + 1) + '/' + LEVELS.length + (LEVELS[levelIdx].ai ? ' Boss' : ''));
+  ctx.fillText(lvlTxt, W - 10, 17); ctx.textAlign = 'left';
+
+  // Bottom bar & single active submenu
+  ctx.font = 'bold 12px ' + sans;
+  const bar = barButtons(), barH = flow(bar, W, H - 4);
+  const sub = buildOpen ? buildButtons() : makeOpen ? makeButtons() : [];
+  const subH = sub.length ? flow(sub, W, H - 4 - barH) : 0;
+  ui.botH = barH + subH + 4;
+  ctx.fillStyle = 'rgba(12,14,18,0.6)'; ctx.fillRect(0, H - ui.botH, W, ui.botH);
+  ui.hit.push({ x: 0, y: H - ui.botH, w: W, h: ui.botH, fn: () => {} });
+  if (sub.length) drawButtons(sub);
+  drawButtons(bar);
+
+  // Left vertical Oxygen Bar outside gameplay area
+  const lw = ui.leftW, sideH = Math.max(80, H - hudH - ui.botH);
+  ctx.fillStyle = 'rgba(12,14,18,0.85)'; ctx.fillRect(0, hudH, lw, sideH);
+  ui.hit.push({ x: 0, y: hudH, w: lw, h: sideH, fn: () => {} });
+  const af = Math.max(0, Math.min(1, state.air / CONFIG.airMax));
+  const obx = 11, oby = hudH + 22, obw = 16, obh = Math.max(32, sideH - 54);
+  ctx.fillStyle = '#bfefff'; ctx.font = 'bold 11px ' + sans; ctx.textAlign = 'center';
+  ctx.fillText('O₂', lw / 2, hudH + 11);
+  ctx.fillStyle = 'rgba(255,255,255,0.14)'; rr(obx, oby, obw, obh, 6); ctx.fill();
+  const fillH = Math.max(af > 0 ? 4 : 0, obh * af);
+  ctx.fillStyle = af < 0.25 ? '#ff5a5a' : '#4fd8ff';
+  if (fillH > 0) { rr(obx, oby + obh - fillH, obw, fillH, 6); ctx.fill(); }
+  ctx.fillStyle = '#ffffff'; ctx.font = 'bold 11px ' + sans;
+  ctx.fillText(Math.ceil(state.air), lw / 2, oby + obh + 11);
+  ctx.fillStyle = '#9fb0bb'; ctx.font = '10px ' + sans;
+  ctx.fillText(dom('airtxt').textContent, lw / 2, oby + obh + 23);
+  ctx.textAlign = 'left';
+
+  // Right vertical Unit Bar: sprite next to count
+  const rw = ui.rightW, rx0 = W - rw;
+  ctx.fillStyle = 'rgba(12,14,18,0.85)'; ctx.fillRect(rx0, hudH, rw, sideH);
+  ui.hit.push({ x: rx0, y: hudH, w: rw, h: sideH, fn: () => {} });
+  const tot = totalUnits();
+  ctx.font = 'bold 11px ' + sans; ctx.textAlign = 'center';
+  ctx.fillStyle = tot >= CONFIG.maxUnits ? '#ff8a3d' : '#9fb0bb';
+  ctx.fillText(tot + '/' + CONFIG.maxUnits, rx0 + rw / 2, hudH + 12);
+  ctx.textAlign = 'left';
+  const unitRows = [
+    { type: 'dwarf',  cnt: dwarves().length },
+    { type: 'digger', cnt: countType('digger') },
+    { type: 'laser',  cnt: countType('laser') },
+    { type: 'flyer',  cnt: countType('flyer') },
+    { type: 'truck',  cnt: countType('truck') }
+  ];
+  const rowH = Math.min(36, Math.floor((sideH - 28) / unitRows.length));
+  unitRows.forEach((u, i) => {
+    const ry = hudH + 24 + i * rowH;
+    const anySel = state.workers.some(w => state.selected.has(w.id) && w.type === u.type);
+    ctx.fillStyle = anySel ? 'rgba(79,216,255,0.22)' : 'rgba(255,255,255,0.05)';
+    rr(rx0 + 4, ry, rw - 8, rowH - 4, 6); ctx.fill();
+    iconUnit(u.type, rx0 + 18, ry + (rowH - 4) / 2);
+    ctx.fillStyle = u.cnt ? '#ffffff' : '#6c7680'; ctx.font = 'bold 13px ' + sans;
+    ctx.fillText('' + u.cnt, rx0 + 35, ry + (rowH - 4) / 2 + 1);
+    ui.hit.push({ x: rx0 + 4, y: ry, w: rw - 8, h: rowH - 4, fn: () => {
+      state.selBuilding = null;
+      state.selected.clear();
+      state.workers.filter(w => w.type === u.type).forEach(w => state.selected.add(w.id));
+      updateHud();
+    } });
+  });
+
+  // Truck mode toggle (Rock Wall / Water Moat) when at least one truck is selected
+  const truckSel = state.workers.some(w => w.type === 'truck' && state.selected.has(w.id));
+  if (truckSel && !over) {
+    ctx.font = 'bold 12px ' + sans;
+    const lbl = truckMode === 'water' ? 'Truck: Water Moat' : 'Truck: Rock Wall';
+    const bw = Math.ceil(ctx.measureText(lbl).width) + 24, bh = 26;
+    const cxM = lw + (W - lw - rw) / 2, bx = cxM - bw / 2, by = H - ui.botH - 58;
+    ctx.fillStyle = truckMode === 'water' ? '#1e5070' : '#2f4530';
+    rr(bx, by, bw, bh, 8); ctx.fill();
+    ctx.strokeStyle = truckMode === 'water' ? '#4fd8ff' : '#7dff9b'; ctx.stroke();
+    ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.fillText(lbl, cxM, by + bh / 2 + 1); ctx.textAlign = 'left';
+    ui.hit.push({ x: bx, y: by, w: bw, h: bh, fn: () => { truckMode = truckMode === 'rock' ? 'water' : 'rock'; } });
+  }
+
+  // In-game selected building upgrade widget (▲ + level + cost + Water Plant ON/OFF)
+  if (state.selBuilding && !over) {
+    const b = state.selBuilding;
+    if (!state.buildings.includes(b)) { state.selBuilding = null; }
+    else {
+      const lvl = b.lvl || 0;
+      const sx = Math.max(lw + 75, Math.min(rx0 - 75, ((b.x + 1) * T - cam.x) * cam.z / DPR));
+      const sy = Math.max(hudH + 22, Math.min(H - ui.botH - 22, (b.y * T - cam.y) * cam.z / DPR - 18));
+      const extraToggle = b.type === 'P' ? 42 : 0;
+      if (lvl < 3) {
+        const cost = upgrCost(b), can = state.rubble >= cost;
+        const lbl = '▲ Lv' + lvl + '→' + (lvl + 1) + '  ' + cost;
+        ctx.font = 'bold 12px ' + sans;
+        const upW = Math.ceil(ctx.measureText(lbl).width) + 30, pw = upW + extraToggle, ph = 28, px = sx - pw / 2, py = sy - ph / 2;
+        ctx.fillStyle = can ? 'rgba(20,30,38,0.95)' : 'rgba(30,24,24,0.9)';
+        rr(px, py, upW, ph, 8); ctx.fill();
+        ctx.strokeStyle = can ? '#4fd8ff' : '#7d848b'; ctx.lineWidth = 1.5; ctx.stroke(); ctx.lineWidth = 1;
+        ctx.fillStyle = can ? '#7dff9b' : '#7d848b';
+        ctx.fillText('▲ Lv' + lvl + '→' + (lvl + 1), px + 8, sy + 1);
+        const rOff = ctx.measureText('▲ Lv' + lvl + '→' + (lvl + 1) + ' ').width;
+        iconRubble(px + 14 + rOff, sy);
+        ctx.fillStyle = can ? '#ffffff' : '#9aa0a6';
+        ctx.fillText('' + cost, px + 24 + rOff, sy + 1);
+        ui.hit.push({ x: px, y: py, w: upW, h: ph, fn: () => upgradeSpecificBay(b) });
+        if (b.type === 'P') {
+          const tx = px + upW + 4, on = b.active !== false;
+          ctx.fillStyle = on ? '#1f4f6b' : '#4a2b2b'; rr(tx, py, 38, ph, 8); ctx.fill();
+          ctx.strokeStyle = on ? '#4fd8ff' : '#ff8a3d'; ctx.stroke();
+          ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.fillText(on ? 'ON' : 'OFF', tx + 19, sy + 1); ctx.textAlign = 'left';
+          ui.hit.push({ x: tx, y: py, w: 38, h: ph, fn: () => { b.active = b.active === false; } });
+        }
+      } else {
+        ctx.font = 'bold 12px ' + sans;
+        const upW = 76, px = sx - (upW + extraToggle) / 2, py = sy - 12;
+        ctx.fillStyle = 'rgba(22,25,32,0.92)'; rr(px, py, upW, 24, 8); ctx.fill();
+        ctx.strokeStyle = '#ffd23f'; ctx.stroke();
+        ctx.fillStyle = '#ffd23f'; ctx.textAlign = 'center'; ctx.fillText('MAX Lv3', px + upW / 2, sy + 1); ctx.textAlign = 'left';
+        ui.hit.push({ x: px, y: py, w: upW, h: 24, fn: () => {} });
+        if (b.type === 'P') {
+          const tx = px + upW + 4, on = b.active !== false;
+          ctx.fillStyle = on ? '#1f4f6b' : '#4a2b2b'; rr(tx, py, 38, 24, 8); ctx.fill();
+          ctx.strokeStyle = on ? '#4fd8ff' : '#ff8a3d'; ctx.stroke();
+          ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.fillText(on ? 'ON' : 'OFF', tx + 19, sy + 1); ctx.textAlign = 'left';
+          ui.hit.push({ x: tx, y: py, w: 38, h: 24, fn: () => { b.active = b.active === false; } });
+        }
+      }
+    }
+  }
+
+  // Minimap (upper left next to O2 bar, respects fog of war)
+  if (miniOpen) {
+    const cols = state.grid[0].length, rows = state.grid.length, mw = Math.min(132, W * 0.28), cellSz = mw / cols, mh = cellSz * rows, mx = lw + 8, my = hudH + 8;
+    ui.mini = { x: mx, y: my, w: mw, h: mh, cell: cellSz };
+    ctx.fillStyle = 'rgba(0,0,0,0.65)'; ctx.fillRect(mx - 3, my - 3, mw + 6, mh + 6);
+    const col = { '#': '#5a4330', H: '#7e8690', X: '#31353d', c: '#4fd8ff', G: '#ff4fa3', E: '#ff3b3b', N: '#8a7cff', W: '#2d6c9a', V: '#e0561c', '.': '#1a1612', T: '#1a1612', B: '#37c9a5' };
+    for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+      ctx.fillStyle = isSeen(x, y) ? (col[state.grid[y][x]] || '#000') : '#070605';
+      ctx.fillRect(mx + x * cellSz, my + y * cellSz, Math.ceil(cellSz), Math.ceil(cellSz));
+    }
+    const dot = (o, c) => { ctx.fillStyle = c; ctx.fillRect(mx + o.x * cellSz - 1.5, my + o.y * cellSz - 1.5, 3, 3); };
+    state.moles.forEach(o => { if (isSeen(Math.floor(o.x), Math.floor(o.y))) dot(o, '#d9b38a'); });
+    state.ai.workers.forEach(o => { if (isSeen(Math.floor(o.x), Math.floor(o.y))) dot(o, '#ff5a5a'); });
+    state.workers.forEach(o => dot(o, '#6fd0ff'));
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1;
+    ctx.strokeRect(mx + cam.x / T * cellSz, my + cam.y / T * cellSz, canvas.width / cam.z / T * cellSz, canvas.height / cam.z / T * cellSz);
+    ui.hit.push({ x: mx - 3, y: my - 3, w: mw + 6, h: mh + 6, fn: () => {} });
+    const bx = mx + mw - 16, by = my + 2;
+    ctx.fillStyle = 'rgba(20,24,30,0.85)'; rr(bx, by, 14, 14, 3); ctx.fill();
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 11px ' + sans; ctx.textAlign = 'center'; ctx.fillText('×', bx + 7, by + 7.5); ctx.textAlign = 'left';
+    ui.hit.push({ x: bx - 2, y: by - 2, w: 18, h: 18, fn: () => { miniOpen = false; } });
+  } else {
+    ui.mini = null;
+  }
+
+  if (over) {
+    ctx.font = 'bold 22px ' + sans; ctx.textAlign = 'center'; ctx.fillStyle = state.won ? '#7dff9b' : '#ff7a7a';
+    const lines = wrap(msg, W - lw - rw - 48);
+    lines.forEach((l, i) => ctx.fillText(l, W / 2, H / 2 - 42 + (i - (lines.length - 1) / 2) * 28));
+    if (state.won) {
+      const lbl = dom('next').textContent;
+      ctx.font = 'bold 15px ' + sans;
+      const bw = Math.max(130, Math.ceil(ctx.measureText(lbl).width) + 36), bh = 38;
+      const bx = W / 2 - bw / 2, by = H / 2 + 6;
+      ctx.fillStyle = '#e0a030'; rr(bx, by, bw, bh, 10); ctx.fill();
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5; ctx.stroke(); ctx.lineWidth = 1;
+      ctx.fillStyle = '#06121a'; ctx.fillText(lbl, W / 2, by + bh / 2 + 1);
+      ui.hit.push({ x: bx, y: by, w: bw, h: bh, fn: () => dom('next').click() });
+    }
+    ctx.textAlign = 'left';
+  } else if (msg) {
+    ctx.font = '13px ' + sans; const maxMsgW = W - lw - rw - 16;
+    const tw = Math.min(maxMsgW, ctx.measureText(msg).width + 24), py = H - 8 - ui.botH - 18;
+    const cxMsg = lw + (W - lw - rw) / 2;
+    ctx.fillStyle = 'rgba(12,14,18,0.8)'; rr(cxMsg - tw / 2, py - 13, tw, 26, 13); ctx.fill();
+    ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.fillText(msg, cxMsg, py + 1, tw - 12); ctx.textAlign = 'left';
+  }
+  if (helpOpen) {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, W, H);
+    ctx.font = '13px ' + sans; const lines = wrap(dom('legend').textContent, W - 56), ph = lines.length * 18 + 64, py = Math.max(8, (H - ph) / 2);
+    ctx.fillStyle = 'rgba(14,17,22,0.96)'; rr(12, py, W - 24, ph, 12); ctx.fill(); ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.stroke();
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 15px ' + sans; ctx.fillText('How to play', 28, py + 22);
+    ctx.font = '13px ' + sans; ctx.fillStyle = '#d8dee3'; lines.forEach((l, i) => ctx.fillText(l, 28, py + 46 + i * 18));
+    ctx.fillStyle = '#9fb0bb'; ctx.fillText('Tap anywhere to close', 28, py + ph - 14);
+  }
+}
+
+canvas.addEventListener('pointerdown', e => {
+  const r = canvas.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top, m = ui.mini;
+  if (helpOpen) { helpOpen = false; e.stopImmediatePropagation(); return; }
+  for (let i = ui.hit.length - 1; i >= 0; i--) { const h = ui.hit[i]; if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) {
+    if (m && h.x < m.x && x >= m.x && x <= m.x + m.w && y >= m.y && y <= m.y + m.h) break;
+    if (h.fn.toString() !== '() => {}' || !(m && x >= m.x && x <= m.x + m.w && y >= m.y && y <= m.y + m.h)) { h.fn(); e.stopImmediatePropagation(); return; }
+  } }
+  if (m && x >= m.x && x <= m.x + m.w && y >= m.y && y <= m.y + m.h) { miniDrag = true; canvas.setPointerCapture(e.pointerId); miniGo(x, y); e.stopImmediatePropagation(); return; }
+});
+canvas.addEventListener('pointermove', e => {
+  if (!miniDrag) return;
+  const r = canvas.getBoundingClientRect(); miniGo(e.clientX - r.left, e.clientY - r.top); e.stopImmediatePropagation();
+});
+const endMini = () => { miniDrag = false; };
+canvas.addEventListener('pointerup', endMini); canvas.addEventListener('pointercancel', endMini);
+
+// ---- Camera ----
+const cam = { x: 0, y: 0, z: 1 };
+let panMode = false, gest = null, panning = null;
+const ptrs = new Map();
+function clampCam() {
+  const g = editor.active ? editor.grid : state.grid;
+  const W = g[0].length * T, H = g.length * T, vw = canvas.width / cam.z, vh = canvas.height / cam.z;
+  const leftPad = (ui.leftW + 10) * DPR / cam.z, rightPad = (ui.rightW + 10) * DPR / cam.z;
+  const topPad = (ui.topH + 10) * DPR / cam.z, botPad = (ui.botH + 10) * DPR / cam.z;
+  const playW = Math.max(40, vw - leftPad - rightPad), playH = Math.max(40, vh - topPad - botPad);
+  cam.x = W <= playW ? -leftPad - (playW - W) / 2 : Math.max(-leftPad, Math.min(W - (vw - rightPad), cam.x));
+  cam.y = H <= playH ? -topPad - (playH - H) / 2 : Math.max(-topPad, Math.min(H - (vh - botPad), cam.y));
+}
+function zoomAt(sx, sy, nz) {
+  const g = editor.active ? editor.grid : state.grid;
+  const W = g[0].length * T, H = g.length * T;
+  nz = Math.max(Math.min(DPR, Math.max(0.15 * DPR, Math.min(canvas.width / W, canvas.height / H))), Math.min(3 * DPR, nz));
+  const wx = sx / cam.z + cam.x, wy = sy / cam.z + cam.y;
+  cam.z = nz; cam.x = wx - sx / nz; cam.y = wy - sy / nz; clampCam();
+}
+canvas.addEventListener('pointerdown', e => {
+  ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (ptrs.size === 2) {
+    state.drag = null; editor.painting = false;
+    const [a, b] = [...ptrs.values()];
+    gest = { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, z: cam.z, cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2 };
+    e.stopImmediatePropagation(); return;
+  }
+  if (e.button === 1 || e.button === 2 || panMode) {
+    panning = { id: e.pointerId, lx: e.clientX, ly: e.clientY };
+    canvas.setPointerCapture(e.pointerId); e.stopImmediatePropagation();
+  }
+});
+canvas.addEventListener('pointermove', e => {
+  if (ptrs.has(e.pointerId)) ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  const r = canvas.getBoundingClientRect(), k = canvas.width / r.width;
+  if (gest && ptrs.size >= 2) {
+    const [a, b] = [...ptrs.values()], d = Math.hypot(a.x - b.x, a.y - b.y), cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+    cam.x -= (cx - gest.cx) * k / cam.z; cam.y -= (cy - gest.cy) * k / cam.z; gest.cx = cx; gest.cy = cy;
+    zoomAt((cx - r.left) * k, (cy - r.top) * k, gest.z * d / gest.d);
+    e.stopImmediatePropagation(); return;
+  }
+  if (panning && panning.id === e.pointerId) {
+    cam.x -= (e.clientX - panning.lx) * k / cam.z; cam.y -= (e.clientY - panning.ly) * k / cam.z;
+    panning.lx = e.clientX; panning.ly = e.clientY; clampCam(); e.stopImmediatePropagation();
+  }
+});
+const endPtr = e => {
+  ptrs.delete(e.pointerId); if (ptrs.size < 2) gest = null;
+  if (panning && panning.id === e.pointerId) { panning = null; e.stopImmediatePropagation(); }
+};
+canvas.addEventListener('pointerup', endPtr); canvas.addEventListener('pointercancel', endPtr);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('wheel', e => { e.preventDefault(); const { sx, sy } = scr(e); zoomAt(sx, sy, cam.z * (e.deltaY < 0 ? 1.15 : 1 / 1.15)); }, { passive: false });
+addEventListener('keydown', e => {
+  const m = 80 / cam.z, d = { ArrowLeft: [-m, 0], a: [-m, 0], ArrowRight: [m, 0], d: [m, 0], ArrowUp: [0, -m], w: [0, -m], ArrowDown: [0, m], s: [0, m] }[e.key];
+  if (d) { cam.x += d[0]; cam.y += d[1]; clampCam(); e.preventDefault(); }
+});
+$('pan').addEventListener('click', () => { panMode = !panMode; $('pan').textContent = 'Pan: ' + (panMode ? 'on' : 'off'); canvas.style.cursor = panMode ? 'grab' : 'default'; });
+$('zin').addEventListener('click', () => zoomAt(canvas.width / 2, canvas.height / 2, cam.z * 1.25));
+$('zout').addEventListener('click', () => zoomAt(canvas.width / 2, canvas.height / 2, cam.z / 1.25));
+
+canvas.addEventListener('pointerdown', e => {
+  const { fx, fy, x, y } = pt(e);
+  if (editor.active) {
+    editor.painting = true;
+    paintEditorAt(x, y);
+    canvas.setPointerCapture(e.pointerId);
+    return;
+  }
+  if (state.won || state.lost) return;
+  if (state.building) {
+    if (state.building !== 'tele') placeBay(x, y); else if (cell(x, y) === '.' && state.rubble >= CONFIG.teleCost) {
+      state.grid[y][x] = 'T'; state.tele = { x, y }; state.rubble -= CONFIG.teleCost;
+    }
+    state.building = false; updateHud(); return;
+  }
+  let near = null, best = 0.55;
+  for (const w of state.workers) { const dd = Math.hypot(w.x - fx, w.y - fy); if (dd < best) { best = dd; near = w; } }
+  let enemy = null, eBest = 0.7;
+  for (const m of state.moles) { if (isSeen(Math.floor(m.x), Math.floor(m.y))) { const dd = Math.hypot(m.x - fx, m.y - fy); if (dd < eBest) { eBest = dd; enemy = m; } } }
+  for (const o of state.ai.workers) { if (!o.dead && isSeen(Math.floor(o.x), Math.floor(o.y))) { const dd = Math.hypot(o.x - fx, o.y - fy); if (dd < eBest) { eBest = dd; enemy = o; } } }
+  let drop = null, dBest = 0.75;
+  for (const dr of state.drops) { if (isSeen(Math.floor(dr.x), Math.floor(dr.y))) { const dd = Math.hypot(dr.x - fx, dr.y - fy); if (dd < dBest) { dBest = dd; drop = dr; } } }
+  const bld = state.buildings.find(b => fx >= b.x && fx < b.x + 2 && fy >= b.y && fy < b.y + 2);
+
+  if (near) {
+    state.selBuilding = null;
+    const crew = state.workers.filter(o => o.type === 'dwarf' && state.selected.has(o.id));
+    if ((near.type === 'laser' || near.type === 'flyer') && !near.pilot && crew.length) {
+      Object.assign(crew[0], { board: near.id, job: null, job2: null, target: null, collect: null, path: [], repath: 0 }); state.selected.delete(crew[0].id);
+    } else if (state.selected.has(near.id)) state.selected.delete(near.id); else state.selected.add(near.id);
+  } else if (enemy) {
+    state.selBuilding = null;
+    if (state.selected.size) {
+      let ordered = 0;
+      for (const w of state.workers) {
+        if (!state.selected.has(w.id) || w.type === 'truck') continue;
+        if ((w.type === 'laser' || w.type === 'flyer') && !w.pilot) continue;
+        Object.assign(w, { target: enemy, collect: null, job: null, job2: null, dest: null, board: null, path: [], repath: 0 });
+        ordered++;
+      }
+      if (ordered) { state.notice = 'Ordered ' + ordered + ' unit' + (ordered > 1 ? 's' : '') + ' to attack!'; state.noticeT = 2; }
+    } else {
+      state.notice = 'Select units first, then tap an enemy to attack it.'; state.noticeT = 2.5;
+    }
+  } else if (drop) {
+    state.selBuilding = null;
+    if (state.selected.size) {
+      const miners = state.workers.filter(w => state.selected.has(w.id) && w.type === 'dwarf');
+      if (!miners.length) {
+        state.notice = 'Select a miner on foot to collect items on the ground.'; state.noticeT = 2.5;
+      } else {
+        let sent = 0;
+        for (const w of miners) {
+          if (drop.kind === 'pick' && (w.pickTier || 0) >= drop.tier) continue;
+          Object.assign(w, { collect: drop, target: null, job: null, job2: null, dest: null, board: null, path: [], repath: 0 });
+          sent++;
+        }
+        if (sent) { state.notice = 'Sent ' + sent + ' miner' + (sent > 1 ? 's' : '') + ' to collect the item!'; state.noticeT = 2; }
+        else { state.notice = 'Selected miner already has an equal or better pickaxe.'; state.noticeT = 2.5; }
+      }
+    } else {
+      state.notice = 'Select a miner first, then tap an item on the ground to collect it.'; state.noticeT = 2.5;
+    }
+  } else if (bld) {
+    state.selected.clear();
+    state.selBuilding = state.selBuilding === bld ? null : bld;
+  } else if (isSeen(x, y) && isRock(x, y)) {
+    state.selBuilding = null;
+    const sel = state.selected.size ? new Set(state.selected) : null;
+    if (sel) for (const w of state.workers) if (sel.has(w.id)) { w.target = null; w.collect = null; }
+    state.drag = { mode: 'dig', x0: x, y0: y, x1: x, y1: y, sel,
+      erase: state.marks.has(key(x, y)) && sameOwners(state.marks.get(key(x, y)), sel) };
+    canvas.setPointerCapture(e.pointerId);
+  } else {
+    state.selBuilding = null;
+    const trucks = state.workers.filter(o => o.type === 'truck' && state.selected.has(o.id));
+    if (trucks.length && isSeen(x, y) && (truckMode === 'water' ? cell(x, y) === '.' : isDumpTarget(x, y))) {
+      const sel = new Set(trucks.map(o => o.id));
+      const M = truckMode === 'water' ? state.waterMarks : state.dumpMarks;
+      state.drag = { mode: truckMode === 'water' ? 'water' : 'dump', x0: x, y0: y, x1: x, y1: y, sel,
+        erase: M.has(key(x, y)) && sameOwners(M.get(key(x, y)), sel) };
+      canvas.setPointerCapture(e.pointerId);
+    } else {
+      const ok = state.workers.filter(o => (o.type === 'laser' || o.type === 'flyer') && o.pilot && state.selected.has(o.id) && (o.type === 'flyer' ? isFly(x, y) : isFloor(x, y)));
+      if (ok.length) ok.forEach(o => Object.assign(o, { dest: { x: x + 0.5, y: y + 0.5 }, target: null, collect: null, job: null, job2: null, path: [], repath: 0 }));
+      else state.selected.clear();
+    }
+  }
+  updateHud();
+});
+canvas.addEventListener('pointermove', e => {
+  if (editor.active && editor.painting) {
+    const { x, y } = pt(e);
+    paintEditorAt(x, y);
+    return;
+  }
+  const d = state.drag; if (!d) return;
+  const { x, y } = pt(e);
+  d.x1 = Math.max(0, Math.min(state.grid[0].length - 1, x));
+  d.y1 = Math.max(0, Math.min(state.grid.length - 1, y));
+});
+function endDrag(apply) {
+  editor.painting = false;
+  const d = state.drag; state.drag = null;
+  if (!d || !apply) return;
+  if (d.mode === 'dump' || d.mode === 'water') {
+    const isW = d.mode === 'water', M = isW ? state.waterMarks : state.dumpMarks;
+    let placed = 0;
+    for (let y = Math.min(d.y0, d.y1); y <= Math.max(d.y0, d.y1); y++)
+      for (let x = Math.min(d.x0, d.x1); x <= Math.max(d.x0, d.x1); x++)
+        if (isSeen(x, y) && (isW ? cell(x, y) === '.' : isDumpTarget(x, y))) {
+          if (d.erase) M.delete(key(x, y));
+          else { M.set(key(x, y), d.sel); placed++; }
+        }
+    if (placed && isW && state.water < 1 && !state.workers.some(o => o.type === 'truck' && o.cargoType === 'water' && o.cargo > 0)) {
+      state.notice = 'Water moat ordered! Build a Water Plant to extract Water from rubble.'; state.noticeT = 3.5;
+    } else if (placed && !isW && state.rock < 1 && !state.workers.some(o => o.type === 'truck' && o.cargoType === 'rock' && o.cargo > 0)) {
+      state.notice = 'Rock wall ordered! Dig rock with a Digger to fill Rock inventory.'; state.noticeT = 3;
+    }
+    updateHud();
+    return;
+  }
+  let hardWarn = false, bedWarn = false;
+  for (let y = Math.min(d.y0, d.y1); y <= Math.max(d.y0, d.y1); y++)
+    for (let x = Math.min(d.x0, d.x1); x <= Math.max(d.x0, d.x1); x++)
+      if (isSeen(x, y) && isRock(x, y)) {
+        if (d.erase) state.marks.delete(key(x, y));
+        else {
+          state.marks.set(key(x, y), d.sel);
+          if (cell(x, y) === 'H') hardWarn = true;
+          if (cell(x, y) === 'X') bedWarn = true;
+        }
+      }
+  if (bedWarn && !state.workers.some(w => w.type === 'laser' && w.pilot)) {
+    state.notice = 'Dark Bedrock! Only a crewed Laser machine can slowly clear it.'; state.noticeT = 3.5;
+  } else if (hardWarn && !state.workers.some(w => w.type === 'digger')) {
+    state.notice = 'Hard rock! Only digger machines can drill gray rock.'; state.noticeT = 3;
+  }
+  updateHud();
+}
+canvas.addEventListener('pointerup', () => endDrag(true));
+canvas.addEventListener('pointercancel', () => endDrag(false));
+$('selall').addEventListener('click', () => { state.selBuilding = null; state.workers.forEach(w => state.selected.add(w.id)); updateHud(); });
+$('build').addEventListener('click', () => startBuild('tele'));
+for (const t of ['D', 'L', 'F', 'K', 'O', 'P']) {
+  const el = $('bay' + t);
+  if (el) el.addEventListener('click', () => {
+    const b = t === 'O' || t === 'P' ? null : state.buildings.find(o => o.type === t);
+    if (!b) startBuild(t); else makeUnit(t);
+  });
+}
+$('call').addEventListener('click', () => {
+  if (totalUnits() >= CONFIG.maxUnits) { state.notice = 'Unit limit reached (' + CONFIG.maxUnits + '/' + CONFIG.maxUnits + ').'; state.noticeT = 3; updateHud(); return; }
+  if (state.tele && state.rubble >= CONFIG.minerCost) {
+    state.rubble -= CONFIG.minerCost; addWorker(state.tele.x + 0.5, state.tele.y + 0.5); updateHud();
+  }
+});
+$('restart').addEventListener('click', () => newGame());
+$('next').addEventListener('click', () => {
+  if (customLevel) { openEditor(customLevel); return; }
+  levelIdx = (levelIdx + 1) % LEVELS.length; newGame();
+});
+
+let last = performance.now();
+function frame(now) {
+  if (canvas.width !== Math.round(canvas.clientWidth * DPR) || canvas.height !== Math.round(canvas.clientHeight * DPR)) resize();
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+  update(dt); draw(now); vignette(); updateAir(); drawUI();
+  requestAnimationFrame(frame);
+}
+newGame();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
