@@ -1507,7 +1507,8 @@ function saveEditorLevel(asNew) {
   }
   writeSavedLevels(list);
 }
-
+const scr = e => { const r = canvas.getBoundingClientRect(); return { sx: (e.clientX - r.left) * canvas.width / r.width, sy: (e.clientY - r.top) * canvas.height / r.height }; };
+const pt = e => { const { sx, sy } = scr(e), fx = (sx / cam.z + cam.x) / T, fy = (sy / cam.z + cam.y) / T; return { fx, fy, x: Math.floor(fx), y: Math.floor(fy) }; };
 // ---- In-window interface ----
 let DPR = 1, helpOpen = true, buildOpen = false, makeOpen = false, miniOpen = true, miniDrag = false;
 const ui = { hit: [], mini: null, topH: 34, botH: 42, leftW: 38, rightW: 60 };
